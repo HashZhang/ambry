@@ -37,6 +37,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -256,6 +257,7 @@ abstract class OperationRequest implements Runnable {
   private final BlobId blobId;
   protected final ReplicaId replicaId;
   private final RequestOrResponse request;
+  private final long operationQueuingTimeInMs = System.currentTimeMillis();
   private ResponseHandler responseHandler;
   protected boolean sslEnabled;
   private Port port;
@@ -273,6 +275,7 @@ abstract class OperationRequest implements Runnable {
     this.responseHandler = context.getResponseHandler();
     this.port = replicaId.getDataNodeId().getPortToConnectTo(context.getSslEnabledDatacenters());
     this.sslEnabled = port.getPortType() == PortType.SSL;
+    context.getCoordinatorMetrics().totalRequestsInFlight.incrementAndGet();
   }
 
   protected abstract Response getResponse(DataInputStream dataInputStream)
@@ -293,8 +296,10 @@ abstract class OperationRequest implements Runnable {
 
   @Override
   public void run() {
+    context.getCoordinatorMetrics().totalRequestsInExecution.incrementAndGet();
     ConnectedChannel connectedChannel = null;
     long startTimeInMs = System.currentTimeMillis();
+    context.getCoordinatorMetrics().operationRequestQueuingTimeInMs.update(startTimeInMs - operationQueuingTimeInMs);
 
     try {
       logger.trace("{} {} checking out connection", context, replicaId);
@@ -350,6 +355,8 @@ abstract class OperationRequest implements Runnable {
       }
       markRequest();
       updateRequest(System.currentTimeMillis() - startTimeInMs);
+      context.getCoordinatorMetrics().totalRequestsInExecution.decrementAndGet();
+      context.getCoordinatorMetrics().totalRequestsInFlight.decrementAndGet();
     }
   }
 

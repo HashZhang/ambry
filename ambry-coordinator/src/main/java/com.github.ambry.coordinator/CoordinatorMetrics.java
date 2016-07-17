@@ -21,11 +21,11 @@ import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.clustermap.DataNodeId;
 import com.github.ambry.messageformat.MessageFormatErrorCodes;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 
 /**
@@ -37,6 +37,7 @@ public class CoordinatorMetrics {
   public final Histogram getBlobPropertiesOperationLatencyInMs;
   public final Histogram getBlobUserMetadataOperationLatencyInMs;
   public final Histogram getBlobOperationLatencyInMs;
+  public final Histogram operationRequestQueuingTimeInMs;
 
   public final Meter putBlobOperationRate;
   public final Meter deleteBlobOperationRate;
@@ -75,6 +76,8 @@ public class CoordinatorMetrics {
   public final Counter totalCrossColoProxyCallCount;
 
   public final Gauge<Integer> crossDCCallsEnabled;
+  public final AtomicInteger totalRequestsInFlight = new AtomicInteger(0);
+  public final AtomicInteger totalRequestsInExecution = new AtomicInteger(0);
 
   private final Map<DataNodeId, RequestMetrics> requestMetrics;
 
@@ -92,6 +95,8 @@ public class CoordinatorMetrics {
         registry.histogram(MetricRegistry.name(AmbryCoordinator.class, "getBlobUserMetadataOperationLatencyInMs"));
     getBlobOperationLatencyInMs =
         registry.histogram(MetricRegistry.name(AmbryCoordinator.class, "getBlobOperationLatencyInMs"));
+    operationRequestQueuingTimeInMs =
+        registry.histogram(MetricRegistry.name(AmbryCoordinator.class, "operationRequestQueuingTimeInMs"));
 
     putBlobOperationRate = registry.meter(MetricRegistry.name(AmbryCoordinator.class, "putBlobOperationRate"));
     deleteBlobOperationRate = registry.meter(MetricRegistry.name(AmbryCoordinator.class, "deleteBlobOperationRate"));
@@ -148,6 +153,24 @@ public class CoordinatorMetrics {
     requestMetrics = new HashMap<DataNodeId, RequestMetrics>();
     for (DataNodeId dataNodeId : clusterMap.getDataNodeIds()) {
       requestMetrics.put(dataNodeId, new RequestMetrics(registry, dataNodeId));
+    }
+
+    if (!registry.getNames().contains(MetricRegistry.name(AmbryCoordinator.class, "totalRequestsInFlight"))) {
+      Gauge<Integer> requestsInFlight = new Gauge<Integer>() {
+        @Override
+        public Integer getValue() {
+          return totalRequestsInFlight.get();
+        }
+      };
+      registry.register(MetricRegistry.name(AmbryCoordinator.class, "totalRequestsInFlight"), requestsInFlight);
+
+      Gauge<Integer> requestsInExecution = new Gauge<Integer>() {
+        @Override
+        public Integer getValue() {
+          return totalRequestsInExecution.get();
+        }
+      };
+      registry.register(MetricRegistry.name(AmbryCoordinator.class, "totalRequestsInExecution"), requestsInExecution);
     }
   }
 
