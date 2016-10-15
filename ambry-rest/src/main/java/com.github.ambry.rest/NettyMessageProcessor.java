@@ -17,6 +17,7 @@ import com.github.ambry.config.NettyConfig;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.handler.codec.http.HttpContent;
+import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpObject;
 import io.netty.handler.codec.http.HttpRequest;
 import io.netty.handler.codec.http.LastHttpContent;
@@ -238,9 +239,8 @@ public class NettyMessageProcessor extends SimpleChannelInboundHandler<HttpObjec
           resetState();
         }
         onRequestAborted(new RestServiceException("HttpObject received is null or not of a known type",
-            RestServiceErrorCode.UnknownHttpObject));
+            RestServiceErrorCode.MalformedRequest));
       }
-
       if (lastChannelReadTime != null) {
         nettyMetrics.channelReadIntervalInMs.update(currentTime - lastChannelReadTime);
         logger.trace("Delay between channel reads is {} ms for channel {}", (currentTime - lastChannelReadTime),
@@ -284,11 +284,11 @@ public class NettyMessageProcessor extends SimpleChannelInboundHandler<HttpObjec
         try {
           // We need to maintain state about the request itself for the subsequent parts (if any) that come in. We will
           // attach content to the request as the content arrives.
-          if (HttpPostRequestDecoder.isMultipart(httpRequest)) {
+          if (HttpMethod.POST.equals(httpRequest.getMethod()) && HttpPostRequestDecoder.isMultipart(httpRequest)) {
             nettyMetrics.multipartPostRequestRate.mark();
-            request = new NettyMultipartRequest(httpRequest, nettyMetrics);
+            request = new NettyMultipartRequest(httpRequest, ctx.channel(), nettyMetrics);
           } else {
-            request = new NettyRequest(httpRequest, nettyMetrics);
+            request = new NettyRequest(httpRequest, ctx.channel(), nettyMetrics);
           }
           responseChannel.setRequest(request);
           logger.trace("Channel {} now handling request {}", ctx.channel(), request.getUri());

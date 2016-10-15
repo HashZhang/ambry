@@ -14,8 +14,6 @@
 package com.github.ambry.clustermap;
 
 import com.github.ambry.utils.SystemTime;
-import java.util.ArrayDeque;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
@@ -55,6 +53,8 @@ class FixedBackoffResourceStatePolicy implements ResourceStatePolicy {
       if (count == failureCountThreshold) {
         logger.error("Resource " + resource + " has gone down");
       }
+      logger.trace("Resource {} remains in down state at time {}; adding downtime of {} ms", resource,
+          SystemTime.getInstance().milliseconds(), retryBackoffMs);
       downUntil.set(SystemTime.getInstance().milliseconds() + retryBackoffMs);
     }
   }
@@ -86,6 +86,16 @@ class FixedBackoffResourceStatePolicy implements ResourceStatePolicy {
       if (SystemTime.getInstance().milliseconds() < downUntil.get()) {
         down = true;
       }
+    }
+
+    if (down) {
+      logger
+          .trace("Resource {} is down; failureCount: {}; failureCountThreshold: {}; remaining time: {}; hard down: {}",
+              resource, failureCount.get(), failureCountThreshold,
+              downUntil.get() - SystemTime.getInstance().milliseconds(), hardDown);
+    } else {
+      logger.trace("Resource {} is not down; failureCount: {}; failureCountThreshold: {}", resource,
+          failureCount.get(), failureCountThreshold);
     }
     return down;
   }

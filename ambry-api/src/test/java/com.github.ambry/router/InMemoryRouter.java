@@ -99,54 +99,47 @@ public class InMemoryRouter implements Router {
       return userMetadata;
     }
 
+    /**
+     * @return the entire blob as a {@link ByteBuffer}
+     */
     public ByteBuffer getBlob() {
       return ByteBuffer.wrap(blob.array());
     }
-  }
 
-  @Override
-  public Future<BlobInfo> getBlobInfo(String blobId) {
-    return getBlobInfo(blobId, null);
-  }
-
-  @Override
-  public Future<BlobInfo> getBlobInfo(String blobId, Callback<BlobInfo> callback) {
-    FutureResult<BlobInfo> futureResult = new FutureResult<BlobInfo>();
-    handlePrechecks(futureResult, callback);
-    BlobInfo operationResult = null;
-    Exception exception = null;
-    if (blobId == null || blobId.length() != BLOB_ID_SIZE) {
-      completeOperation(futureResult, callback, null,
-          new RouterException("Cannot accept operation because blob ID is invalid", RouterErrorCode.InvalidBlobId));
-    } else {
-      try {
-        if (deletedBlobs.contains(blobId)) {
-          exception = new RouterException("Blob deleted", RouterErrorCode.BlobDeleted);
-        } else if (!blobs.containsKey(blobId)) {
-          exception = new RouterException("Blob not found", RouterErrorCode.BlobDoesNotExist);
-        } else {
-          InMemoryBlob blob = blobs.get(blobId);
-          operationResult = new BlobInfo(blob.getBlobProperties(), blob.getUserMetadata());
+    /**
+     * @param range the {@link ByteRange} for the blob, or null.
+     * @return the blob content within the provided range, or the entire blob, if the range is null.
+     * @throws RouterException if the range was non-null, but could not be resolved.
+     */
+    public ByteBuffer getBlob(ByteRange range)
+        throws RouterException {
+      ByteBuffer buf;
+      if (range == null) {
+        buf = getBlob();
+      } else {
+        ByteRange resolvedRange;
+        try {
+          resolvedRange = range.toResolvedByteRange(blob.array().length);
+        } catch (IllegalArgumentException e) {
+          throw new RouterException("Invalid range for blob", e, RouterErrorCode.RangeNotSatisfiable);
         }
-      } catch (Exception e) {
-        exception = new RouterException(e, RouterErrorCode.UnexpectedInternalError);
-      } finally {
-        completeOperation(futureResult, callback, operationResult, exception);
+        buf = ByteBuffer.wrap(blob.array(), (int) resolvedRange.getStartOffset(), (int) resolvedRange.getRangeSize());
       }
+      return buf;
     }
-    return futureResult;
   }
 
   @Override
-  public Future<ReadableStreamChannel> getBlob(String blobId) {
-    return getBlob(blobId, null);
+  public Future<GetBlobResult> getBlob(String blobId, GetBlobOptions options) {
+    return getBlob(blobId, options, null);
   }
 
   @Override
-  public Future<ReadableStreamChannel> getBlob(String blobId, Callback<ReadableStreamChannel> callback) {
-    FutureResult<ReadableStreamChannel> futureResult = new FutureResult<ReadableStreamChannel>();
+  public Future<GetBlobResult> getBlob(String blobId, GetBlobOptions options, Callback<GetBlobResult> callback) {
+    FutureResult<GetBlobResult> futureResult = new FutureResult<>();
     handlePrechecks(futureResult, callback);
-    ReadableStreamChannel operationResult = null;
+    ReadableStreamChannel blobDataChannel = null;
+    BlobInfo blobInfo = null;
     Exception exception = null;
     if (blobId == null || blobId.length() != BLOB_ID_SIZE) {
       completeOperation(futureResult, callback, null,
@@ -159,11 +152,25 @@ public class InMemoryRouter implements Router {
           exception = new RouterException("Blob not found", RouterErrorCode.BlobDoesNotExist);
         } else {
           InMemoryBlob blob = blobs.get(blobId);
-          operationResult = new ByteBufferRSC(blob.getBlob());
+          switch (options.getOperationType()) {
+            case Data:
+              blobDataChannel = new ByteBufferRSC(blob.getBlob(options.getRange()));
+              break;
+            case BlobInfo:
+              blobInfo = new BlobInfo(blob.getBlobProperties(), blob.getUserMetadata());
+              break;
+            case All:
+              blobDataChannel = new ByteBufferRSC(blob.getBlob(options.getRange()));
+              blobInfo = new BlobInfo(blob.getBlobProperties(), blob.getUserMetadata());
+              break;
+          }
         }
+      } catch (RouterException e) {
+        exception = e;
       } catch (Exception e) {
         exception = new RouterException(e, RouterErrorCode.UnexpectedInternalError);
       } finally {
+        GetBlobResult operationResult = exception == null ? new GetBlobResult(blobInfo, blobDataChannel) : null;
         completeOperation(futureResult, callback, operationResult, exception);
       }
     }

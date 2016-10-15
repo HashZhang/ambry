@@ -31,10 +31,7 @@ import com.github.ambry.protocol.PutRequest;
 import com.github.ambry.protocol.PutResponse;
 import com.github.ambry.protocol.RequestOrResponse;
 import com.github.ambry.store.StoreKey;
-import com.github.ambry.utils.ByteBufferInputStream;
 import com.github.ambry.utils.Time;
-import java.io.DataInputStream;
-import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -77,9 +74,11 @@ class PutOperation {
   private final ResponseHandler responseHandler;
   private final BlobProperties blobProperties;
   private final byte[] userMetadata;
+  private final ReadableStreamChannel channel;
   private final ByteBufferAsyncWritableChannel chunkFillerChannel;
   private final FutureResult<String> futureResult;
   private final Callback<String> callback;
+  private final ReadyForPollCallback readyForPollCallback;
   private final Time time;
 
   // Parameters associated with the state.
@@ -142,12 +141,16 @@ class PutOperation {
    * @param channel the {@link ReadableStreamChannel} containing the blob data.
    * @param futureResult the future that will contain the result of the operation.
    * @param callback the callback that is to be called when the operation completes.
+   * @param readyForPollCallback The callback to be used to notify the router of any state changes within this
+   *                             operation.
    * @param time the Time instance to use.
    * @throws RouterException if there is an error in constructing the PutOperation with the given parameters.
    */
   PutOperation(RouterConfig routerConfig, NonBlockingRouterMetrics routerMetrics, ClusterMap clusterMap,
       ResponseHandler responseHandler, BlobProperties blobProperties, byte[] userMetadata,
-      ReadableStreamChannel channel, FutureResult<String> futureResult, Callback<String> callback, Time time)
+      ReadableStreamChannel channel, FutureResult<String> futureResult, Callback<String> callback,
+      ReadyForPollCallback readyForPollCallback,
+      ByteBufferAsyncWritableChannel.ChannelEventListener writableChannelEventListener, Time time)
       throws RouterException {
     submissionTimeMs = time.milliseconds();
     blobSize = blobProperties.getBlobSize();
@@ -170,8 +173,10 @@ class PutOperation {
     this.responseHandler = responseHandler;
     this.blobProperties = blobProperties;
     this.userMetadata = userMetadata;
+    this.channel = channel;
     this.futureResult = futureResult;
     this.callback = callback;
+    this.readyForPollCallback = readyForPollCallback;
     this.time = time;
     bytesFilledSoFar = 0;
     chunkCounter = -1;
@@ -182,8 +187,13 @@ class PutOperation {
       putChunks[i] = new PutChunk();
     }
     metadataPutChunk = numDataChunks > 1 ? new MetadataPutChunk() : null;
+    chunkFillerChannel = new ByteBufferAsyncWritableChannel(writableChannelEventListener);
+  }
 
-    chunkFillerChannel = new ByteBufferAsyncWritableChannel();
+  /**
+   * Start reading from the channel containing the data for this operation.
+   */
+  void startReadingFromChannel() {
     channel.readInto(chunkFillerChannel, new Callback<Long>() {
       @Override
       public void onCompletion(Long result, Exception exception) {
@@ -242,11 +252,12 @@ class PutOperation {
   /**
    * Handle the given {@link ResponseInfo} by handing it over to the correct {@link PutChunk} that issued the request.
    * @param responseInfo the {@link ResponseInfo} to be handled.
+   * @param putResponse the {@link PutResponse} associated with this response.
    */
-  void handleResponse(ResponseInfo responseInfo) {
-    PutChunk putChunk =
-        correlationIdToPutChunk.remove(((RequestOrResponse) responseInfo.getRequest()).getCorrelationId());
-    putChunk.handleResponse(responseInfo);
+  void handleResponse(ResponseInfo responseInfo, PutResponse putResponse) {
+    PutChunk putChunk = correlationIdToPutChunk
+        .remove(((RequestOrResponse) responseInfo.getRequestInfo().getRequest()).getCorrelationId());
+    putChunk.handleResponse(responseInfo, putResponse);
     if (putChunk.isComplete()) {
       onChunkOperationComplete(putChunk);
     }
@@ -261,6 +272,9 @@ class PutOperation {
   void onChunkOperationComplete(PutChunk chunk) {
     if (chunk.getChunkBlobId() == null) {
       // the overall operation has failed if any of the chunk fails.
+      if (chunk.getChunkException() == null) {
+        logger.error("Operation on chunk failed, but no exception was set");
+      }
       logger.error("Failed putting chunk at index: " + chunk.getChunkIndex() + ", failing the entire operation");
       operationCompleted = true;
     } else if (numDataChunks == 1 || chunk == metadataPutChunk) {
@@ -317,6 +331,7 @@ class PutOperation {
               maybeStopTrackingWaitForChunkTime();
               bytesFilledSoFar += chunkToFill.fillFrom(channelReadBuffer);
               if (chunkToFill.isReady()) {
+                readyForPollCallback.onPollReady();
                 updateChunkFillerWaitTimeMetrics();
               }
               if (!channelReadBuffer.hasRemaining()) {
@@ -338,6 +353,8 @@ class PutOperation {
         }
       }
     } catch (Exception e) {
+      routerMetrics.chunkFillerUnexpectedErrorCount.inc();
+      readyForPollCallback.onPollReady();
       setOperationExceptionAndComplete(new RouterException("PutOperation fillChunks encountered unexpected error", e,
           RouterErrorCode.UnexpectedInternalError));
     }
@@ -500,10 +517,20 @@ class PutOperation {
 
   /**
    * The time at which this operation was submitted.
-   * @return return the time at which the operation was submitted.
+   * @return the time at which the operation was submitted.
    */
   long getSubmissionTimeMs() {
     return submissionTimeMs;
+  }
+
+  /**
+   * if this is a composite object, fill the list with successfully put chunk ids.
+   * @param chunkIdList the list to fill with chunk ids.
+   */
+  void addSuccessfullyPutChunkIds(List<String> chunkIdList) {
+    if (numDataChunks > 1) {
+      metadataPutChunk.addChunkIds(chunkIdList);
+    }
   }
 
   /**
@@ -644,6 +671,13 @@ class PutOperation {
     }
 
     /**
+     * @return the {@link RouterException}, if any, encountered for the current chunk.
+     */
+    RouterException getChunkException() {
+      return chunkException;
+    }
+
+    /**
      * @return true if this PutChunk is free so a chunk of the overall blob can be filled in.
      */
     boolean isFree() {
@@ -704,6 +738,9 @@ class PutOperation {
         state = ChunkState.Ready;
       } catch (RouterException e) {
         setOperationExceptionAndComplete(e);
+      } catch (Exception e) {
+        setOperationExceptionAndComplete(new RouterException("Operation tracker could not be initialized", e,
+            RouterErrorCode.UnexpectedInternalError));
       }
     }
 
@@ -769,7 +806,8 @@ class PutOperation {
     }
 
     /**
-     * This is one of two main entry points to this class, the other being {@link #handleResponse(ResponseInfo)}.
+     * This is one of two main entry points to this class, the other being
+     * {@link #handleResponse(ResponseInfo, PutResponse)}.
      * Apart from fetching requests to send out, this also checks for timeouts of issued requests,
      * status of the operation and anything else that needs to be done within this PutChunk. The callers guarantee
      * that this method is called on all the PutChunks of an operation until either the operation,
@@ -796,7 +834,10 @@ class PutOperation {
         Map.Entry<Integer, ChunkPutRequestInfo> entry = inFlightRequestsIterator.next();
         if (time.milliseconds() - entry.getValue().startTimeMs > routerConfig.routerRequestTimeoutMs) {
           onErrorResponse(entry.getValue().replicaId);
-          chunkException = new RouterException("Timed out waiting for responses", RouterErrorCode.OperationTimedOut);
+          // Do not notify this as a failure to the response handler, as this timeout could simply be due to
+          // connection unavailability. If there is indeed a network error, the NetworkClient will provide an error
+          // response and the response handler will be notified accordingly.
+          chunkException = new RouterException("Timed out waiting for a response", RouterErrorCode.OperationTimedOut);
           inFlightRequestsIterator.remove();
         } else {
           // the entries are ordered by correlation id and time. Break on the first request that has not timed out.
@@ -815,7 +856,7 @@ class PutOperation {
         String hostname = replicaId.getDataNodeId().getHostname();
         Port port = replicaId.getDataNodeId().getPortToConnectTo();
         PutRequest putRequest = createPutRequest();
-        RequestInfo request = new RequestInfo(hostname, port, putRequest);
+        RouterRequestInfo request = new RouterRequestInfo(hostname, port, putRequest, replicaId);
         int correlationId = putRequest.getCorrelationId();
         correlationIdToChunkPutRequestInfo
             .put(correlationId, new ChunkPutRequestInfo(replicaId, putRequest, time.milliseconds()));
@@ -837,8 +878,8 @@ class PutOperation {
      */
     protected PutRequest createPutRequest() {
       return new PutRequest(NonBlockingRouter.correlationIdGenerator.incrementAndGet(), routerConfig.routerHostname,
-          chunkBlobId, blobProperties, ByteBuffer.wrap(userMetadata), new ByteBufferInputStream(buf.duplicate()),
-          buf.remaining(), BlobType.DataBlob);
+          chunkBlobId, blobProperties, ByteBuffer.wrap(userMetadata), buf.duplicate(), buf.remaining(),
+          BlobType.DataBlob);
     }
 
     /**
@@ -865,9 +906,10 @@ class PutOperation {
      * Finally, a check is done to determine whether the operation on the chunk is eligible for completion,
      * if so the operation is completed right away.
      * @param responseInfo the response received for a request sent out on behalf of this chunk.
+     * @param putResponse the {@link PutResponse} associated with this response.
      */
-    void handleResponse(ResponseInfo responseInfo) {
-      int correlationId = ((PutRequest) responseInfo.getRequest()).getCorrelationId();
+    void handleResponse(ResponseInfo responseInfo, PutResponse putResponse) {
+      int correlationId = ((PutRequest) responseInfo.getRequestInfo().getRequest()).getCorrelationId();
       ChunkPutRequestInfo chunkPutRequestInfo = correlationIdToChunkPutRequestInfo.remove(correlationId);
       if (chunkPutRequestInfo == null) {
         // Ignore right away. This could mean:
@@ -884,13 +926,13 @@ class PutOperation {
       boolean isSuccessful;
       if (responseInfo.getError() != null) {
         setChunkException(new RouterException("Operation timed out", RouterErrorCode.OperationTimedOut));
-        responseHandler
-            .onRequestResponseException(chunkPutRequestInfo.replicaId, new IOException("NetworkClient error"));
         isSuccessful = false;
       } else {
-        try {
-          PutResponse putResponse =
-              PutResponse.readFrom(new DataInputStream(new ByteBufferInputStream(responseInfo.getResponse())));
+        if (putResponse == null) {
+          setChunkException(new RouterException("Response deserialization received an unexpected error",
+              RouterErrorCode.UnexpectedInternalError));
+          isSuccessful = false;
+        } else {
           if (putResponse.getCorrelationId() != correlationId) {
             // The NetworkClient associates a response with a request based on the fact that only one request is sent
             // out over a connection id, and the response received on a connection id must be for the latest request
@@ -905,7 +947,6 @@ class PutOperation {
             // we do not notify the ResponseHandler responsible for failure detection as this is an unexpected error.
           } else {
             ServerErrorCode putError = putResponse.getError();
-            responseHandler.onRequestResponseError(chunkPutRequestInfo.replicaId, putError);
             if (putError == ServerErrorCode.No_Error) {
               logger.trace("The putRequest was successful");
               isSuccessful = true;
@@ -915,12 +956,6 @@ class PutOperation {
               isSuccessful = false;
             }
           }
-        } catch (IOException e) {
-          // This should really not happen. Again, we do not notify the ResponseHandler responsible for failure
-          // detection.
-          setChunkException(new RouterException("Response deserialization received an unexpected error", e,
-              RouterErrorCode.UnexpectedInternalError));
-          isSuccessful = false;
         }
       }
       if (isSuccessful) {
@@ -1021,6 +1056,9 @@ class PutOperation {
   class MetadataPutChunk extends PutChunk {
     StoreKey[] chunkIds;
     int chunksDone;
+    // since chunk operations could complete out of order, this index simply tracks the farthest chunk that was
+    // successfully put (which helps in the getChunkIds() method).
+    int maxFilledChunkIndex = -1;
 
     /**
      * Initialize the MetadataPutChunk.
@@ -1040,9 +1078,25 @@ class PutOperation {
     void addChunkId(BlobId chunkBlobId, int chunkIndex) {
       chunkIds[chunkIndex] = chunkBlobId;
       chunksDone++;
+      if (chunkIndex > maxFilledChunkIndex) {
+        maxFilledChunkIndex = chunkIndex;
+      }
       if (chunksDone == numDataChunks) {
-        buf = MetadataContentSerDe.serializeMetadataContent(Arrays.asList(chunkIds));
+        buf = MetadataContentSerDe
+            .serializeMetadataContent(routerConfig.routerMaxPutChunkSizeBytes, blobSize, Arrays.asList(chunkIds));
         onFillComplete();
+      }
+    }
+
+    /**
+     * Add all the successfully put chunk ids of the overall blob to the passed in list.
+     * @param chunkIdList list to fill with chunk ids.
+     */
+    void addChunkIds(List<String> chunkIdList) {
+      for (int i = 0; i <= maxFilledChunkIndex; i++) {
+        if (chunkIds[i] != null) {
+          chunkIdList.add(chunkIds[i].getID());
+        }
       }
     }
 
@@ -1055,8 +1109,8 @@ class PutOperation {
     @Override
     protected PutRequest createPutRequest() {
       return new PutRequest(NonBlockingRouter.correlationIdGenerator.incrementAndGet(), routerConfig.routerHostname,
-          chunkBlobId, blobProperties, ByteBuffer.wrap(userMetadata), new ByteBufferInputStream(buf.duplicate()),
-          buf.remaining(), BlobType.MetadataBlob);
+          chunkBlobId, blobProperties, ByteBuffer.wrap(userMetadata), buf.duplicate(), buf.remaining(),
+          BlobType.MetadataBlob);
     }
   }
 

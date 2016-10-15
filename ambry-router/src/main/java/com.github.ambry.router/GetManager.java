@@ -14,15 +14,20 @@
 package com.github.ambry.router;
 
 import com.github.ambry.clustermap.ClusterMap;
+import com.github.ambry.clustermap.ReplicaId;
 import com.github.ambry.commons.BlobIdFactory;
 import com.github.ambry.commons.ResponseHandler;
+import com.github.ambry.commons.ServerErrorCode;
 import com.github.ambry.config.RouterConfig;
-import com.github.ambry.messageformat.BlobInfo;
+import com.github.ambry.network.NetworkClientErrorCode;
 import com.github.ambry.network.RequestInfo;
 import com.github.ambry.network.ResponseInfo;
 import com.github.ambry.protocol.GetRequest;
+import com.github.ambry.protocol.GetResponse;
 import com.github.ambry.protocol.RequestOrResponse;
+import com.github.ambry.utils.ByteBufferInputStream;
 import com.github.ambry.utils.Time;
+import java.io.DataInputStream;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -34,7 +39,7 @@ import org.slf4j.LoggerFactory;
 
 
 /**
- * GetManager manages GetBlob and GetBlobInfo operations. This is just a template for now.
+ * GetManager manages GetBlob and GetBlobInfo operations.
  * These methods have to be thread safe.
  */
 class GetManager {
@@ -55,6 +60,7 @@ class GetManager {
   private final ResponseHandler responseHandler;
   private final NonBlockingRouterMetrics routerMetrics;
   private final OperationCompleteCallback operationCompleteCallback;
+  private final ReadyForPollCallback readyForPollCallback;
 
   private class GetRequestRegistrationCallbackImpl implements RequestRegistrationCallback<GetOperation> {
     private List<RequestInfo> requestListToFill;
@@ -78,56 +84,46 @@ class GetManager {
    * @param routerConfig  The {@link RouterConfig} containing the configs for the PutManager.
    * @param routerMetrics The {@link NonBlockingRouterMetrics} to be used for reporting metrics.
    * @param operationCompleteCallback The {@link OperationCompleteCallback} to use to complete operations.
+   * @param readyForPollCallback The callback to be used to notify the router of any state changes within the
+   *                             operations.
    * @param time The {@link Time} instance to use.
    */
   GetManager(ClusterMap clusterMap, ResponseHandler responseHandler, RouterConfig routerConfig,
-      NonBlockingRouterMetrics routerMetrics, OperationCompleteCallback operationCompleteCallback, Time time) {
+      NonBlockingRouterMetrics routerMetrics, OperationCompleteCallback operationCompleteCallback,
+      ReadyForPollCallback readyForPollCallback, Time time) {
     this.clusterMap = clusterMap;
     blobIdFactory = new BlobIdFactory(clusterMap);
     this.responseHandler = responseHandler;
     this.routerConfig = routerConfig;
     this.routerMetrics = routerMetrics;
     this.operationCompleteCallback = operationCompleteCallback;
+    this.readyForPollCallback = readyForPollCallback;
     this.time = time;
     getOperations = Collections.newSetFromMap(new ConcurrentHashMap<GetOperation, Boolean>());
   }
 
   /**
-   * Submit an operation to get the BlobInfo associated with a blob asynchronously.
-   * @param blobId the blobId for which the BlobInfo is being requested, in string form.
-   * @param futureResult the {@link FutureResult} that contains the pending result of the operation.
-   * @param callback the {@link Callback} object to be called on completion of the operation.
-   */
-  void submitGetBlobInfoOperation(String blobId, FutureResult<BlobInfo> futureResult, Callback<BlobInfo> callback) {
-    try {
-      GetBlobInfoOperation getBlobInfoOperation =
-          new GetBlobInfoOperation(routerConfig, routerMetrics, clusterMap, responseHandler, blobId, futureResult,
-              callback, operationCompleteCallback, time);
-      getOperations.add(getBlobInfoOperation);
-    } catch (RouterException e) {
-      routerMetrics.getBlobInfoErrorCount.inc();
-      routerMetrics.countError(e);
-      routerMetrics.operationDequeuingRate.mark();
-      operationCompleteCallback.completeOperation(futureResult, callback, null, e);
-    }
-  }
-
-  /**
    * Submit an operation to get a blob asynchronously.
-   * @param blobId the blobId for which the BlobInfo is being requested, in string form.
-   * @param futureResult the {@link FutureResult} that contains the pending result of the operation.
-   * @param callback the {@link Callback} object to be called on completion of the operation.
+   * @param blobId The blobId for which the BlobInfo is being requested, in string form.
+   * @param options The {@link GetBlobOptions} associated witht the operation.
+   * @param futureResult The {@link FutureResult} that contains the pending result of the operation.
+   * @param callback The {@link Callback} object to be called on completion of the operation.
    */
-  void submitGetBlobOperation(String blobId, FutureResult<ReadableStreamChannel> futureResult,
-      Callback<ReadableStreamChannel> callback) {
+  void submitGetBlobOperation(String blobId, GetBlobOptions options, FutureResult<GetBlobResult> futureResult,
+      Callback<GetBlobResult> callback) {
     try {
-      GetBlobOperation getBlobOperation =
-          new GetBlobOperation(routerConfig, routerMetrics, clusterMap, responseHandler, blobId, futureResult, callback,
-              operationCompleteCallback, blobIdFactory, time);
-      getOperations.add(getBlobOperation);
+      GetOperation getOperation;
+      if (options.getOperationType() == GetBlobOptions.OperationType.BlobInfo) {
+        getOperation =
+            new GetBlobInfoOperation(routerConfig, routerMetrics, clusterMap, responseHandler, blobId, options,
+                futureResult, callback, operationCompleteCallback, time);
+      } else {
+        getOperation = new GetBlobOperation(routerConfig, routerMetrics, clusterMap, responseHandler, blobId, options,
+            futureResult, callback, operationCompleteCallback, readyForPollCallback, blobIdFactory, time);
+      }
+      getOperations.add(getOperation);
     } catch (RouterException e) {
-      routerMetrics.getBlobErrorCount.inc();
-      routerMetrics.countError(e);
+      routerMetrics.onGetBlobError(e, options);
       routerMetrics.operationDequeuingRate.mark();
       operationCompleteCallback.completeOperation(futureResult, callback, null, e);
     }
@@ -179,11 +175,13 @@ class GetManager {
    */
   void handleResponse(ResponseInfo responseInfo) {
     long startTime = time.milliseconds();
-    GetRequest getRequest = (GetRequest) responseInfo.getRequest();
+    GetResponse getResponse = extractGetResponseAndNotifyResponseHandler(responseInfo);
+    RouterRequestInfo routerRequestInfo = (RouterRequestInfo) responseInfo.getRequestInfo();
+    GetRequest getRequest = (GetRequest) routerRequestInfo.getRequest();
     GetOperation getOperation = correlationIdToGetOperation.remove(getRequest.getCorrelationId());
     if (getOperations.contains(getOperation)) {
       try {
-        getOperation.handleResponse(responseInfo);
+        getOperation.handleResponse(responseInfo, getResponse);
         if (getOperation.isOperationComplete()) {
           remove(getOperation);
         }
@@ -195,6 +193,35 @@ class GetManager {
     } else {
       routerMetrics.ignoredResponseCount.inc();
     }
+  }
+
+  /**
+   * Extract the {@link GetResponse} from the given {@link ResponseInfo}
+   * @param responseInfo the {@link ResponseInfo} from which the {@link GetResponse} is to be extracted.
+   * @return the extracted {@link GetResponse} if there is one; null otherwise.
+   */
+  private GetResponse extractGetResponseAndNotifyResponseHandler(ResponseInfo responseInfo) {
+    GetResponse getResponse = null;
+    ReplicaId replicaId = ((RouterRequestInfo) responseInfo.getRequestInfo()).getReplicaId();
+    NetworkClientErrorCode networkClientErrorCode = responseInfo.getError();
+    if (networkClientErrorCode == null) {
+      try {
+        getResponse = GetResponse
+            .readFrom(new DataInputStream(new ByteBufferInputStream(responseInfo.getResponse())), clusterMap);
+        ServerErrorCode serverError = getResponse.getError();
+        if (serverError == ServerErrorCode.No_Error) {
+          serverError = getResponse.getPartitionResponseInfoList().get(0).getErrorCode();
+        }
+        responseHandler.onEvent(replicaId, serverError);
+      } catch (Exception e) {
+        // Ignore. There is no value in notifying the response handler.
+        logger.error("Response deserialization received unexpected error", e);
+        routerMetrics.responseDeserializationErrorCount.inc();
+      }
+    } else {
+      responseHandler.onEvent(replicaId, networkClientErrorCode);
+    }
+    return getResponse;
   }
 
   /**
@@ -220,7 +247,7 @@ class GetManager {
     if (remove(op)) {
       op.abort(abortCause);
       routerMetrics.operationAbortCount.inc();
-      routerMetrics.countError(abortCause);
+      routerMetrics.onGetBlobError(abortCause, op.getOptions());
     }
   }
 }

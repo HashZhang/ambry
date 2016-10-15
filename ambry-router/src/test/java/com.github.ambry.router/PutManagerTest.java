@@ -23,11 +23,13 @@ import com.github.ambry.config.RouterConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.messageformat.BlobProperties;
 import com.github.ambry.messageformat.BlobType;
+import com.github.ambry.messageformat.CompositeBlobInfo;
 import com.github.ambry.messageformat.MetadataContentSerDe;
 import com.github.ambry.protocol.PutRequest;
 import com.github.ambry.store.StoreKey;
 import com.github.ambry.utils.ByteBufferInputStream;
 import com.github.ambry.utils.MockTime;
+import com.github.ambry.utils.SystemTime;
 import com.github.ambry.utils.TestUtils;
 import com.github.ambry.utils.Utils;
 import java.io.DataInputStream;
@@ -53,6 +55,7 @@ import org.junit.Test;
  * A class to test the Put implementation of the {@link NonBlockingRouter}.
  */
 public class PutManagerTest {
+  private static final long MAX_WAIT_MS = 2000;
   private final MockServerLayout mockServerLayout;
   private final MockTime mockTime = new MockTime();
   private final MockClusterMap mockClusterMap;
@@ -231,8 +234,8 @@ public class PutManagerTest {
     mockSelectorState.set(MockSelectorState.ThrowExceptionOnSend);
     // In the case of an error in poll, the router gets closed, and all the ongoing operations are finished off with
     // RouterClosed error.
-    Exception expectedException = new RouterException("", RouterErrorCode.RouterClosed);
-    submitPutsAndAssertFailure(expectedException, false, false);
+    Exception expectedException = new RouterException("", RouterErrorCode.OperationTimedOut);
+    submitPutsAndAssertFailure(expectedException, true, true);
     // router should get closed automatically
     Assert.assertFalse("Router should be closed", router.isOpen());
     Assert.assertEquals("No ChunkFiller threads should be running after the router is closed", 0,
@@ -494,42 +497,67 @@ public class PutManagerTest {
   }
 
   /**
-   * Test RequestResponseHandler thread exit flow. If the RequestResponseHandlerThread exits on its own (due to an
-   * exception), then the router gets closed immediately along with the completion of all the operations.
+   * Test to verify that the chunk filler goes to sleep when there are no active operations and is woken up when
+   * operations become active.
+   * @throws Exception
    */
   @Test
-  public void testRouterClosingOnRequestResponseHandlerThreadException()
+  public void testChunkFillerSleep()
       throws Exception {
     router = getNonBlockingRouter();
-    int blobSize = chunkSize * random.nextInt(10) + 1;
-    for (int i = 0; i < 2; i++) {
-      RequestAndResult requestAndResult = new RequestAndResult(blobSize);
-      requestAndResultsList.add(requestAndResult);
-      MockReadableStreamChannel putChannel = new MockReadableStreamChannel(blobSize);
-      requestAndResult.result = (FutureResult<String>) router
-          .putBlob(requestAndResult.putBlobProperties, requestAndResult.putUserMetadata, putChannel, null);
+    // At this time there are no put operations, so the ChunkFillerThread will eventually go into WAITING state.
+    Thread chunkFillerThread = TestUtils.getThreadByThisName("ChunkFillerThread");
+    Assert.assertTrue("ChunkFillerThread should have gone to WAITING state as there are no active operations",
+        waitForThreadState(chunkFillerThread, Thread.State.WAITING));
+    int blobSize = chunkSize * 2;
+    RequestAndResult requestAndResult = new RequestAndResult(blobSize);
+    requestAndResultsList.add(requestAndResult);
+    MockReadableStreamChannel putChannel = new MockReadableStreamChannel(blobSize);
+    FutureResult<String> future = (FutureResult<String>) router
+        .putBlob(requestAndResult.putBlobProperties, requestAndResult.putUserMetadata, putChannel, null);
+    ByteBuffer src = ByteBuffer.wrap(requestAndResult.putContent);
+    // There will be two chunks written to the underlying writable channel, and so two events will be fired.
+    int writeSize = blobSize / 2;
+    ByteBuffer buf = ByteBuffer.allocate(writeSize);
+    src.get(buf.array());
+    putChannel.write(buf);
+    // The first write will wake up (or will have woken up) the ChunkFiller thread and it will not go to WAITING until
+    // the operation is complete as an attempt to fill chunks will be done by the ChunkFiller in every iteration
+    // until the operation is complete.
+    Assert.assertTrue(
+        "ChunkFillerThread should have gone to RUNNABLE state as there is an active operation that is not yet complete",
+        waitForThreadState(chunkFillerThread, Thread.State.RUNNABLE));
+    buf.rewind();
+    src.get(buf.array());
+    putChannel.write(buf);
+    // At this time all writes have finished, so the ChunkFiller thread will eventually go (or will have already gone)
+    // to WAITING due to this write.
+    Assert
+        .assertTrue("ChunkFillerThread should have gone to WAITING state as the only active operation is now complete",
+            waitForThreadState(chunkFillerThread, Thread.State.WAITING));
+    Assert
+        .assertTrue("Operation should not take too long to complete", future.await(MAX_WAIT_MS, TimeUnit.MILLISECONDS));
+    requestAndResult.result = future;
+    assertSuccess();
+    assertCloseCleanup();
+  }
+
+  /**
+   * Wait for the given thread to reach the given thread state.
+   * @param thread the thread whose state needs to be checked.
+   * @param state the state that needs to be reached.
+   * @return true if the state is reached within a predetermined timeout, false on timing out.
+   */
+  private boolean waitForThreadState(Thread thread, Thread.State state) {
+    long checkStartTimeMs = SystemTime.getInstance().milliseconds();
+    while (thread.getState() != state) {
+      if (SystemTime.getInstance().milliseconds() - checkStartTimeMs > MAX_WAIT_MS) {
+        return false;
+      } else {
+        Thread.yield();
+      }
     }
-
-    mockSelectorState.set(MockSelectorState.ThrowExceptionOnAllPoll);
-
-    // Now wait till the thread dies
-    while (TestUtils.numThreadsByThisName("RequestResponseHandlerThread") > 0) {
-      Thread.yield();
-    }
-
-    // Now wait until both operations complete.
-    for (RequestAndResult requestAndResult : requestAndResultsList) {
-      requestAndResult.result.await();
-    }
-
-    // Ensure that both operations failed and with the right exceptions.
-    Exception expectedException = new RouterException("", RouterErrorCode.RouterClosed);
-    assertFailure(expectedException);
-    Assert.assertEquals("No ChunkFiller Thread should be running after the router is closed", 0,
-        TestUtils.numThreadsByThisName("ChunkFillerThread"));
-    Assert.assertEquals("No RequestResponseHandler should be running after the router is closed", 0,
-        TestUtils.numThreadsByThisName("RequestResponseHandlerThread"));
-    Assert.assertEquals("All operations should have completed", 0, router.getOperationsCount());
+    return true;
   }
 
   // Methods used by the tests
@@ -637,13 +665,13 @@ public class PutManagerTest {
     // identical. In the process also fill in the map of blobId to serializedPutRequests.
     HashMap<String, ByteBuffer> allChunks = new HashMap<String, ByteBuffer>();
     for (MockServer mockServer : mockServerLayout.getMockServers()) {
-      for (Map.Entry<String, ByteBuffer> blobEntry : mockServer.getBlobs().entrySet()) {
+      for (Map.Entry<String, StoredBlob> blobEntry : mockServer.getBlobs().entrySet()) {
         ByteBuffer chunk = allChunks.get(blobEntry.getKey());
         if (chunk == null) {
-          allChunks.put(blobEntry.getKey(), blobEntry.getValue());
+          allChunks.put(blobEntry.getKey(), blobEntry.getValue().serializedSentPutRequest);
         } else {
           Assert.assertTrue("All requests for the same blob id must be identical except for correlation id",
-              areIdenticalPutRequests(chunk.array(), blobEntry.getValue().array()));
+              areIdenticalPutRequests(chunk.array(), blobEntry.getValue().serializedSentPutRequest.array()));
         }
       }
     }
@@ -668,15 +696,18 @@ public class PutManagerTest {
   private void verifyBlob(String blobId, byte[] originalPutContent, HashMap<String, ByteBuffer> serializedRequests)
       throws Exception {
     ByteBuffer serializedRequest = serializedRequests.get(blobId);
-    PutRequest request = deserializePutRequest(serializedRequest);
+    PutRequest.ReceivedPutRequest request = deserializePutRequest(serializedRequest);
     if (request.getBlobType() == BlobType.MetadataBlob) {
       byte[] data = Utils.readBytesFromStream(request.getBlobStream(), (int) request.getBlobSize());
-      List<StoreKey> dataBlobIds = MetadataContentSerDe
+      CompositeBlobInfo compositeBlobInfo = MetadataContentSerDe
           .deserializeMetadataContentRecord(ByteBuffer.wrap(data), new BlobIdFactory(mockClusterMap));
+      Assert.assertEquals("Wrong max chunk size in metadata", chunkSize, compositeBlobInfo.getChunkSize());
+      Assert.assertEquals("Wrong total size in metadata", originalPutContent.length, compositeBlobInfo.getTotalSize());
+      List<StoreKey> dataBlobIds = compositeBlobInfo.getKeys();
       byte[] content = new byte[(int) request.getBlobProperties().getBlobSize()];
       int offset = 0;
       for (StoreKey key : dataBlobIds) {
-        PutRequest dataBlobPutRequest = deserializePutRequest(serializedRequests.get(key.getID()));
+        PutRequest.ReceivedPutRequest dataBlobPutRequest = deserializePutRequest(serializedRequests.get(key.getID()));
         Utils.readBytesFromStream(dataBlobPutRequest.getBlobStream(), content, offset,
             (int) dataBlobPutRequest.getBlobSize());
         offset += (int) dataBlobPutRequest.getBlobSize();
@@ -693,7 +724,7 @@ public class PutManagerTest {
    * @param serialized the serialized ByteBuffer.
    * @return returns the deserialized output.
    */
-  private PutRequest deserializePutRequest(ByteBuffer serialized)
+  private PutRequest.ReceivedPutRequest deserializePutRequest(ByteBuffer serialized)
       throws IOException {
     serialized.getLong();
     serialized.getShort();
@@ -862,16 +893,6 @@ class MockReadableStreamChannel implements ReadableStreamChannel {
     this.callback = callback;
     this.returnedFuture = new FutureResult<Long>();
     return returnedFuture;
-  }
-
-  @Override
-  public void setDigestAlgorithm(String digestAlgorithm) {
-    throw new IllegalStateException("Not implemented");
-  }
-
-  @Override
-  public byte[] getDigest() {
-    throw new IllegalStateException("Not implemented");
   }
 
   /**

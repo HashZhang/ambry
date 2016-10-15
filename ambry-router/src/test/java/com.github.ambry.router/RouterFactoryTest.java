@@ -46,8 +46,6 @@ public class RouterFactoryTest {
    */
   private VerifiableProperties getVerifiableProperties() {
     Properties properties = new Properties();
-    properties.setProperty("coordinator.hostname", "localhost");
-    properties.setProperty("coordinator.datacenter.name", "DC1");
     properties.setProperty("router.hostname", "localhost");
     properties.setProperty("router.datacenter.name", "DC1");
     return new VerifiableProperties(properties);
@@ -64,8 +62,6 @@ public class RouterFactoryTest {
     List<FactoryAndRouter> factoryAndRouters = new ArrayList<FactoryAndRouter>();
     factoryAndRouters.add(new FactoryAndRouter("com.github.ambry.router.NonBlockingRouterFactory",
         "com.github.ambry.router.NonBlockingRouter"));
-    factoryAndRouters.add(new FactoryAndRouter("com.github.ambry.router.CoordinatorBackedRouterFactory",
-        "com.github.ambry.router.CoordinatorBackedRouter"));
 
     for (FactoryAndRouter factoryAndRouter : factoryAndRouters) {
       RouterFactory routerFactory = Utils

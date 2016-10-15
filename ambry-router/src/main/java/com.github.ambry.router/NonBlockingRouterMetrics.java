@@ -37,6 +37,7 @@ public class NonBlockingRouterMetrics {
   public final Meter putBlobOperationRate;
   public final Meter getBlobInfoOperationRate;
   public final Meter getBlobOperationRate;
+  public final Meter getBlobWithRangeOperationRate;
   public final Meter deleteBlobOperationRate;
   public final Meter operationQueuingRate;
   public final Meter operationDequeuingRate;
@@ -54,6 +55,7 @@ public class NonBlockingRouterMetrics {
   public final Counter putBlobErrorCount;
   public final Counter getBlobInfoErrorCount;
   public final Counter getBlobErrorCount;
+  public final Counter getBlobWithRangeErrorCount;
   public final Counter deleteBlobErrorCount;
   public final Counter operationAbortCount;
   public final Counter routerRequestErrorCount;
@@ -71,8 +73,16 @@ public class NonBlockingRouterMetrics {
   public final Counter blobDeletedErrorCount;
   public final Counter blobDoesNotExistErrorCount;
   public final Counter blobExpiredErrorCount;
+  public final Counter rangeNotSatisfiableErrorCount;
+  public final Counter channelClosedErrorCount;
   public final Counter unknownReplicaResponseError;
   public final Counter unknownErrorCountForOperation;
+  public final Counter responseDeserializationErrorCount;
+  public final Counter operationManagerPollErrorCount;
+  public final Counter operationManagerHandleResponseErrorCount;
+  public final Counter requestResponseHandlerUnexpectedErrorCount;
+  public final Counter chunkFillerUnexpectedErrorCount;
+  public final Counter operationFailureWithUnsetExceptionCount;
 
   // Performance metrics for operation managers.
   public final Histogram putManagerPollTimeMs;
@@ -99,6 +109,18 @@ public class NonBlockingRouterMetrics {
   public Gauge<Long> requestResponseHandlerThreadRunning;
   public Gauge<Integer> activeOperations;
 
+  // metrics for tracking blob sizes and chunking.
+  public final Histogram putBlobSizeBytes;
+  public final Histogram putBlobChunkCount;
+  public final Histogram getBlobSizeBytes;
+  public final Histogram getBlobChunkCount;
+  public final Histogram getBlobWithRangeSizeBytes;
+  public final Histogram getBlobWithRangeTotalBlobSizeBytes;
+  public final Counter simpleBlobPutCount;
+  public final Counter simpleBlobGetCount;
+  public final Counter compositeBlobPutCount;
+  public final Counter compositeBlobGetCount;
+
   // Map that stores dataNode-level metrics.
   private final Map<DataNodeId, NodeLevelMetrics> dataNodeToMetrics;
 
@@ -110,6 +132,8 @@ public class NonBlockingRouterMetrics {
     getBlobInfoOperationRate =
         metricRegistry.meter(MetricRegistry.name(GetBlobInfoOperation.class, "GetBlobInfoOperationRate"));
     getBlobOperationRate = metricRegistry.meter(MetricRegistry.name(GetBlobOperation.class, "GetBlobOperationRate"));
+    getBlobWithRangeOperationRate =
+        metricRegistry.meter(MetricRegistry.name(GetBlobOperation.class, "GetBlobWithRangeOperationRate"));
     deleteBlobOperationRate =
         metricRegistry.meter(MetricRegistry.name(DeleteOperation.class, "DeleteBlobOperationRate"));
     operationQueuingRate = metricRegistry.meter(MetricRegistry.name(NonBlockingRouter.class, "OperationQueuingRate"));
@@ -137,6 +161,8 @@ public class NonBlockingRouterMetrics {
     getBlobInfoErrorCount =
         metricRegistry.counter(MetricRegistry.name(GetBlobInfoOperation.class, "GetBlobInfoErrorCount"));
     getBlobErrorCount = metricRegistry.counter(MetricRegistry.name(GetBlobOperation.class, "GetBlobErrorCount"));
+    getBlobWithRangeErrorCount =
+        metricRegistry.counter(MetricRegistry.name(GetBlobOperation.class, "GetBlobWithRangeErrorCount"));
     deleteBlobErrorCount = metricRegistry.counter(MetricRegistry.name(DeleteOperation.class, "DeleteBlobErrorCount"));
     operationAbortCount = metricRegistry.counter(MetricRegistry.name(NonBlockingRouter.class, "OperationAbortCount"));
     routerRequestErrorCount =
@@ -167,10 +193,26 @@ public class NonBlockingRouterMetrics {
         metricRegistry.counter(MetricRegistry.name(NonBlockingRouter.class, "BlobDoesNotExistErrorCount"));
     blobExpiredErrorCount =
         metricRegistry.counter(MetricRegistry.name(NonBlockingRouter.class, "BlobExpiredErrorCount"));
+    rangeNotSatisfiableErrorCount =
+        metricRegistry.counter(MetricRegistry.name(NonBlockingRouter.class, "RangeNotSatisfiableErrorCount"));
+    channelClosedErrorCount =
+        metricRegistry.counter(MetricRegistry.name(NonBlockingRouter.class, "ChannelClosedErrorCount"));
     unknownReplicaResponseError =
         metricRegistry.counter(MetricRegistry.name(NonBlockingRouter.class, "UnknownReplicaResponseError"));
     unknownErrorCountForOperation =
         metricRegistry.counter(MetricRegistry.name(NonBlockingRouter.class, "UnknownErrorCountForOperation"));
+    responseDeserializationErrorCount =
+        metricRegistry.counter(MetricRegistry.name(NonBlockingRouter.class, "ResponseDeserializationErrorCount"));
+    operationManagerPollErrorCount =
+        metricRegistry.counter(MetricRegistry.name(NonBlockingRouter.class, "OperationManagerPollErrorCount"));
+    operationManagerHandleResponseErrorCount = metricRegistry
+        .counter(MetricRegistry.name(NonBlockingRouter.class, "OperationManagerHandleResponseErrorCount"));
+    requestResponseHandlerUnexpectedErrorCount = metricRegistry
+        .counter(MetricRegistry.name(NonBlockingRouter.class, "RequestResponseHandlerUnexpectedErrorCount"));
+    chunkFillerUnexpectedErrorCount =
+        metricRegistry.counter(MetricRegistry.name(NonBlockingRouter.class, "ChunkFillerUnexpectedErrorCount"));
+    operationFailureWithUnsetExceptionCount =
+        metricRegistry.counter(MetricRegistry.name(NonBlockingRouter.class, "OperationFailureWithUnsetExceptionCount"));
 
     // Performance metrics for operation managers.
     putManagerPollTimeMs = metricRegistry.histogram(MetricRegistry.name(PutManager.class, "PutManagerPollTimeMs"));
@@ -198,6 +240,20 @@ public class NonBlockingRouterMetrics {
         metricRegistry.counter(MetricRegistry.name(NonBlockingRouter.class, "CrossColoRequestCount"));
     crossColoSuccessCount =
         metricRegistry.counter(MetricRegistry.name(NonBlockingRouter.class, "CrossColoSuccessCount"));
+
+    // metrics to track blob sizes and chunking.
+    putBlobSizeBytes = metricRegistry.histogram(MetricRegistry.name(PutManager.class, "PutBlobSizeBytes"));
+    putBlobChunkCount = metricRegistry.histogram(MetricRegistry.name(PutManager.class, "PutBlobChunkCount"));
+    getBlobSizeBytes = metricRegistry.histogram(MetricRegistry.name(GetManager.class, "GetBlobSizeBytes"));
+    getBlobChunkCount = metricRegistry.histogram(MetricRegistry.name(GetManager.class, "GetBlobChunkCount"));
+    getBlobWithRangeSizeBytes =
+        metricRegistry.histogram(MetricRegistry.name(GetBlobOperation.class, "GetBlobWithRangeSizeBytes"));
+    getBlobWithRangeTotalBlobSizeBytes =
+        metricRegistry.histogram(MetricRegistry.name(GetBlobOperation.class, "GetBlobWithRangeTotalBlobSizeBytes"));
+    simpleBlobPutCount = metricRegistry.counter(MetricRegistry.name(PutManager.class, "SimpleBlobPutCount"));
+    simpleBlobGetCount = metricRegistry.counter(MetricRegistry.name(GetManager.class, "SimpleBlobGetCount"));
+    compositeBlobPutCount = metricRegistry.counter(MetricRegistry.name(PutManager.class, "CompositeBlobPutCount"));
+    compositeBlobGetCount = metricRegistry.counter(MetricRegistry.name(GetManager.class, "CompositeBlobGetCount"));
 
     // Track metrics at the DataNode level.
     dataNodeToMetrics = new HashMap<>();
@@ -259,23 +315,36 @@ public class NonBlockingRouterMetrics {
   }
 
   /**
-   * Count errors based on error type.
-   * <p/>
-   * This method should be called when an {@code Operation} is completed or aborted.
-   * @param exception The exception to be counted.
+   * Increment error metrics based on error type.
+   * @param exception The exception associated with this error.
    */
-  void countError(Exception exception) {
-    operationErrorRate.mark();
+  private void onError(Exception exception) {
     if (exception instanceof RouterException) {
-      switch (((RouterException) exception).getErrorCode()) {
-        case AmbryUnavailable:
-          ambryUnavailableErrorCount.inc();
-          break;
+      RouterErrorCode errorCode = ((RouterException) exception).getErrorCode();
+      switch (errorCode) {
         case InvalidBlobId:
           invalidBlobIdErrorCount.inc();
           break;
         case InvalidPutArgument:
           invalidPutArgumentErrorCount.inc();
+          break;
+        case BlobTooLarge:
+          blobTooLargeErrorCount.inc();
+          break;
+        case BadInputChannel:
+          badInputChannelErrorCount.inc();
+          break;
+        case BlobDeleted:
+          blobDeletedErrorCount.inc();
+          break;
+        case BlobExpired:
+          blobExpiredErrorCount.inc();
+          break;
+        case RangeNotSatisfiable:
+          rangeNotSatisfiableErrorCount.inc();
+          break;
+        case AmbryUnavailable:
+          ambryUnavailableErrorCount.inc();
           break;
         case OperationTimedOut:
           operationTimedOutErrorCount.inc();
@@ -286,23 +355,14 @@ public class NonBlockingRouterMetrics {
         case UnexpectedInternalError:
           unexpectedInternalErrorCount.inc();
           break;
-        case BlobTooLarge:
-          blobTooLargeErrorCount.inc();
-          break;
-        case BadInputChannel:
-          badInputChannelErrorCount.inc();
-          break;
         case InsufficientCapacity:
           insufficientCapacityErrorCount.inc();
-          break;
-        case BlobDeleted:
-          blobDeletedErrorCount.inc();
           break;
         case BlobDoesNotExist:
           blobDoesNotExistErrorCount.inc();
           break;
-        case BlobExpired:
-          blobExpiredErrorCount.inc();
+        case ChannelClosed:
+          channelClosedErrorCount.inc();
           break;
         default:
           unknownErrorCountForOperation.inc();
@@ -310,6 +370,71 @@ public class NonBlockingRouterMetrics {
       }
     } else {
       unknownErrorCountForOperation.inc();
+    }
+  }
+
+  /**
+   * Update appropriate metrics on a putBlob operation related error.
+   * @param e the {@link Exception} associated with the error.
+   */
+  void onPutBlobError(Exception e) {
+    onError(e);
+    if (RouterUtils.isSystemHealthError(e)) {
+      putBlobErrorCount.inc();
+      operationErrorRate.mark();
+    }
+  }
+
+  /**
+   * Update appropriate metrics on a getBlob operation related error.
+   * @param e the {@link Exception} associated with the error.
+   * @param options the {@link GetBlobOptions} associated with the request.
+   */
+  void onGetBlobError(Exception e, GetBlobOptions options) {
+    if (options.getOperationType() == GetBlobOptions.OperationType.BlobInfo) {
+      onGetBlobInfoError(e);
+    } else {
+      onGetBlobDataError(e, options);
+    }
+  }
+
+  /**
+   * Update appropriate metrics on a getBlobInfo operation related error.
+   * @param e the {@link Exception} associated with the error.
+   */
+  private void onGetBlobInfoError(Exception e) {
+    onError(e);
+    if (RouterUtils.isSystemHealthError(e)) {
+      getBlobInfoErrorCount.inc();
+      operationErrorRate.mark();
+    }
+  }
+
+  /**
+   * Update appropriate metrics on a getBlob (Data or All) operation related error.
+   * @param e the {@link Exception} associated with the error.
+   * @param options the {@link GetBlobOptions} associated with the request.
+   */
+  private void onGetBlobDataError(Exception e, GetBlobOptions options) {
+    onError(e);
+    if (RouterUtils.isSystemHealthError(e)) {
+      getBlobErrorCount.inc();
+      if (options != null && options.getRange() != null) {
+        getBlobWithRangeErrorCount.inc();
+      }
+      operationErrorRate.mark();
+    }
+  }
+
+  /**
+   * Update appropriate metrics on a deleteBlob operation related error.
+   * @param e the {@link Exception} associated with the error.
+   */
+  void onDeleteBlobError(Exception e) {
+    onError(e);
+    if (RouterUtils.isSystemHealthError(e)) {
+      deleteBlobErrorCount.inc();
+      operationErrorRate.mark();
     }
   }
 

@@ -20,8 +20,11 @@ import com.github.ambry.commons.BlobIdFactory;
 import com.github.ambry.commons.ResponseHandler;
 import com.github.ambry.commons.ServerErrorCode;
 import com.github.ambry.config.RouterConfig;
+import com.github.ambry.messageformat.BlobAll;
 import com.github.ambry.messageformat.BlobData;
+import com.github.ambry.messageformat.BlobInfo;
 import com.github.ambry.messageformat.BlobType;
+import com.github.ambry.messageformat.CompositeBlobInfo;
 import com.github.ambry.messageformat.MessageFormatException;
 import com.github.ambry.messageformat.MessageFormatFlags;
 import com.github.ambry.messageformat.MessageFormatRecord;
@@ -34,9 +37,7 @@ import com.github.ambry.protocol.GetRequest;
 import com.github.ambry.protocol.GetResponse;
 import com.github.ambry.protocol.RequestOrResponse;
 import com.github.ambry.store.StoreKey;
-import com.github.ambry.utils.ByteBufferInputStream;
 import com.github.ambry.utils.Time;
-import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
@@ -67,7 +68,7 @@ import org.slf4j.LoggerFactory;
  * buffered up to the maximum that can be buffered. When fetched chunks are consumed by the caller, subsequent chunks
  * become eligible to be fetched.
  */
-class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
+class GetBlobOperation extends GetOperation {
   // the callback to use to complete the operation.
   private final OperationCompleteCallback operationCompleteCallback;
   // whether the operationCompleteCallback has been called already.
@@ -85,15 +86,23 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
   private int numChunksTotal;
   // the total number of data chunks retrieved so far (and may or may not have been written out yet).
   private int numChunksRetrieved;
+  // the maximum size of a data chunk in bytes
+  private long chunkSize;
+  // the total size of the object being fetched in this operation
+  private long totalSize;
+  // a byte range with defined start/end offsets that has been verified to be within the total blob size
+  private ByteRange resolvedByteRange;
   // a list iterator to the chunk ids that need to be fetched for this operation, if this is a composite blob.
   private ListIterator<StoreKey> chunkIdIterator;
   // chunk index to retrieved chunk buffer mapping.
   private Map<Integer, ByteBuffer> chunkIndexToBuffer;
   // To find the GetChunk to hand over the response quickly.
   private final Map<Integer, GetChunk> correlationIdToGetChunk = new HashMap<>();
-  // The result of this operation. This is instantiated if/when the first bytes of the result arrive and just before
-  // the operation callback is invoked.
-  private GetBlobResult getBlobResult;
+  // the blob info that is populated on OperationType.BlobInfo or OperationType.All
+  private BlobInfo blobInfo;
+  // the ReadableStreamChannel that is populated on OperationType.Blob or OperationType.All requests.
+  private BlobDataReadableStreamChannel blobDataChannel;
+  private final ReadyForPollCallback readyForPollCallback;
 
   private static final Logger logger = LoggerFactory.getLogger(GetBlobOperation.class);
 
@@ -104,20 +113,25 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
    * @param clusterMap the {@link ClusterMap} of the cluster
    * @param responseHandler the {@link ResponseHandler} responsible for failure detection.
    * @param blobIdStr the blob id associated with the operation in string form.
+   * @param options the {@link GetBlobOptions} associated with the operation.
    * @param futureResult the future that will contain the result of the operation.
    * @param callback the callback that is to be called when the operation completes.
    * @param operationCompleteCallback the {@link OperationCompleteCallback} to use to complete operations.
+   * @param readyForPollCallback The callback to be used to notify the router of any state changes within the
+   *                             operations.
    * @param blobIdFactory the factory to use to deserialize keys in a metadata chunk.
    * @param time the Time instance to use.
    * @throws RouterException if there is an error with any of the parameters, such as an invalid blob id.
    */
   GetBlobOperation(RouterConfig routerConfig, NonBlockingRouterMetrics routerMetrics, ClusterMap clusterMap,
-      ResponseHandler responseHandler, String blobIdStr, FutureResult<ReadableStreamChannel> futureResult,
-      Callback<ReadableStreamChannel> callback, OperationCompleteCallback operationCompleteCallback,
+      ResponseHandler responseHandler, String blobIdStr, GetBlobOptions options,
+      FutureResult<GetBlobResult> futureResult, Callback<GetBlobResult> callback,
+      OperationCompleteCallback operationCompleteCallback, ReadyForPollCallback readyForPollCallback,
       BlobIdFactory blobIdFactory, Time time)
       throws RouterException {
-    super(routerConfig, routerMetrics, clusterMap, responseHandler, blobIdStr, futureResult, callback, time);
+    super(routerConfig, routerMetrics, clusterMap, responseHandler, blobIdStr, options, futureResult, callback, time);
     this.operationCompleteCallback = operationCompleteCallback;
+    this.readyForPollCallback = readyForPollCallback;
     this.blobIdFactory = blobIdFactory;
     firstChunk = new FirstGetChunk(blobId);
   }
@@ -134,21 +148,12 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
     if (operationCallbackInvoked.compareAndSet(false, true)) {
       operationCompleteCallback.completeOperation(operationFuture, operationCallback, null, abortCause);
     } else {
-      operationException.set(abortCause);
-      if (getBlobResult != null && getBlobResult.isReadCalled()) {
-        getBlobResult.completeRead();
+      setOperationException(abortCause);
+      if (blobDataChannel != null && blobDataChannel.isReadCalled()) {
+        blobDataChannel.completeRead();
       }
     }
     operationCompleted = true;
-  }
-
-  /**
-   * Return the {@link MessageFormatFlags} to associate with a getBlob operation.
-   * @return {@link MessageFormatFlags#Blob}
-   */
-  @Override
-  MessageFormatFlags getOperationFlag() {
-    return MessageFormatFlags.Blob;
   }
 
   /**
@@ -169,31 +174,36 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
         // chunk retrievals and channel writes will need to happen and for that, this operation needs the GetManager to
         // poll it periodically. If any exception is encountered while processing subsequent chunks, those will be
         // notified during the channel read.
-        routerMetrics.getBlobOperationLatencyMs.update(time.milliseconds() - submissionTimeMs);
+        long timeElapsed = time.milliseconds() - submissionTimeMs;
+        routerMetrics.getBlobOperationLatencyMs.update(timeElapsed);
         Exception e = getOperationException();
-        getBlobResult = e == null ? new GetBlobResult() : null;
-        if (e != null) {
-          routerMetrics.getBlobErrorCount.inc();
-          routerMetrics.countError(e);
+        if (e == null) {
+          blobDataChannel = new BlobDataReadableStreamChannel();
+          operationResult = new GetBlobResult(blobInfo, blobDataChannel);
+        } else {
+          blobDataChannel = null;
+          operationResult = null;
+          routerMetrics.onGetBlobError(e, options);
         }
-        operationCompleteCallback.completeOperation(operationFuture, operationCallback, getBlobResult, e);
+        operationCompleteCallback.completeOperation(operationFuture, operationCallback, operationResult, e);
       }
     }
     chunk.postCompletionCleanup();
-    if (getBlobResult != null) {
-      getBlobResult.maybeWriteToChannel();
+    if (blobDataChannel != null) {
+      blobDataChannel.maybeWriteToChannel();
     }
   }
 
   /**
    * Handle the given {@link ResponseInfo} by handing it over to the appropriate chunk that issued the request.
    * @param responseInfo the {@link ResponseInfo} to be handled.
+   * @param getResponse the {@link GetResponse} associated with this response.
    */
   @Override
-  void handleResponse(ResponseInfo responseInfo) {
-    GetChunk getChunk =
-        correlationIdToGetChunk.remove(((RequestOrResponse) responseInfo.getRequest()).getCorrelationId());
-    getChunk.handleResponse(responseInfo);
+  void handleResponse(ResponseInfo responseInfo, GetResponse getResponse) {
+    GetChunk getChunk = correlationIdToGetChunk
+        .remove(((RequestOrResponse) responseInfo.getRequestInfo().getRequest()).getCorrelationId());
+    getChunk.handleResponse(responseInfo, getResponse);
     if (getChunk.isComplete()) {
       onChunkOperationComplete(getChunk);
     }
@@ -219,8 +229,8 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
         // Although an attempt is made to write to the channel as soon as a chunk is successfully retrieved,
         // the caller might not have called readInto() and passed in a channel at the time. So an attempt is always
         // made from within poll.
-        if (getBlobResult != null) {
-          getBlobResult.maybeWriteToChannel();
+        if (blobDataChannel != null) {
+          blobDataChannel.maybeWriteToChannel();
         }
         // If this is a composite blob, poll for requests for subsequent chunks.
         if (dataChunks != null) {
@@ -229,7 +239,8 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
               dataChunk.initialize(chunkIdIterator.nextIndex(), (BlobId) chunkIdIterator.next());
             }
             if (dataChunk.isInProgress() || (dataChunk.isReady()
-                && numChunksRetrieved - getBlobResult.getNumChunksWrittenOut() < NonBlockingRouter.MAX_IN_MEM_CHUNKS)) {
+                && numChunksRetrieved - blobDataChannel.getNumChunksWrittenOut()
+                < NonBlockingRouter.MAX_IN_MEM_CHUNKS)) {
               dataChunk.poll(requestRegistrationCallback);
               if (dataChunk.isComplete()) {
                 onChunkOperationComplete(dataChunk);
@@ -253,9 +264,9 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
    * A class that implements the result of this GetBlobOperation. This is instantiated if/when the first data chunk of
    * the blob arrives, when the operation callback is invoked.
    */
-  private class GetBlobResult implements ReadableStreamChannel {
+  private class BlobDataReadableStreamChannel implements ReadableStreamChannel {
     // whether this ReadableStreamChannel is open.
-    private boolean isOpen = true;
+    private AtomicBoolean isOpen = new AtomicBoolean(true);
     // whether readInto() has been called yet by the caller on this ReadableStreamChannel.
     private volatile boolean readCalled = false;
     // The channel to write chunks of the blob into. This will be initialized when the caller calls the readInto().
@@ -278,9 +289,10 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
       public void onCompletion(Long result, Exception exception) {
         bytesWritten += result;
         if (exception != null) {
-          operationException.set(exception);
+          setOperationException(exception);
         }
         numChunksWrittenOut++;
+        readyForPollCallback.onPollReady();
       }
     };
 
@@ -295,6 +307,9 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
 
     @Override
     public Future<Long> readInto(AsyncWritableChannel asyncWritableChannel, Callback<Long> callback) {
+      if (!isOpen()) {
+        throw new IllegalStateException("This ReadableStreamChannel has been closed");
+      }
       if (readCalled) {
         throw new IllegalStateException("Cannot read the result of a GetBlob operation more than once");
       }
@@ -305,28 +320,25 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
       if (operationException.get() != null) {
         completeRead();
       }
+      readyForPollCallback.onPollReady();
       return readIntoFuture;
     }
 
     @Override
     public boolean isOpen() {
-      return isOpen;
+      return isOpen.get();
     }
 
     @Override
     public void close()
         throws IOException {
-      isOpen = false;
-    }
-
-    @Override
-    public void setDigestAlgorithm(String digestAlgorithm) {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public byte[] getDigest() {
-      throw new UnsupportedOperationException();
+      if (isOpen.compareAndSet(true, false)) {
+        if (numChunksWrittenOut != numChunksTotal) {
+          setOperationException(new RouterException(
+              "The ReadableStreamChannel for blob data has been closed by the user before all chunks were written out.",
+              RouterErrorCode.ChannelClosed));
+        }
+      }
     }
 
     /**
@@ -366,13 +378,37 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
      */
     void completeRead() {
       if (readIntoCallbackCalled.compareAndSet(false, true)) {
-        readIntoFuture.done(bytesWritten, operationException.get());
+        Exception e = operationException.get();
+        readIntoFuture.done(bytesWritten, e);
         if (readIntoCallback != null) {
-          readIntoCallback.onCompletion(bytesWritten, operationException.get());
+          readIntoCallback.onCompletion(bytesWritten, e);
         }
-        routerMetrics.getBlobOperationTotalTimeMs.update(time.milliseconds() - submissionTimeMs);
+        if (e == null) {
+          updateChunkingAndSizeMetricsOnSuccessfulGet();
+        } else {
+          routerMetrics.onGetBlobError(e, options);
+        }
+        long totalTime = time.milliseconds() - submissionTimeMs;
+        routerMetrics.getBlobOperationTotalTimeMs.update(totalTime);
       }
       operationCompleted = true;
+    }
+
+    /**
+     * Update chunking and size related metrics - blob size, chunk count, and whether the blob is simple or composite.
+     */
+    private void updateChunkingAndSizeMetricsOnSuccessfulGet() {
+      routerMetrics.getBlobSizeBytes.update(bytesWritten);
+      routerMetrics.getBlobChunkCount.update(numChunksTotal);
+      if (options != null && options.getRange() != null) {
+        routerMetrics.getBlobWithRangeSizeBytes.update(bytesWritten);
+        routerMetrics.getBlobWithRangeTotalBlobSizeBytes.update(totalSize);
+      }
+      if (numChunksTotal == 1) {
+        routerMetrics.simpleBlobGetCount.inc();
+      } else {
+        routerMetrics.compositeBlobGetCount.inc();
+      }
     }
   }
 
@@ -384,12 +420,15 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
   private class GetChunk {
     // the operation tracker used to track the operation on the current chunk.
     private OperationTracker chunkOperationTracker;
-    // whether the operation on the current chunk has completed.
-    private boolean chunkCompleted;
     // the blob id of the current chunk.
     private BlobId chunkBlobId;
+    // whether the operation on the current chunk has completed.
+    private boolean chunkCompleted;
+    // In general, when the operation tracker returns success, any previously saved exceptions are cleared. This flag
+    // indicates that the set chunk exception should not be overwritten even when the operation tracker reports success.
+    protected boolean retainChunkExceptionOnSuccess;
     // the index of the current chunk in the overall blob.
-    private int chunkIndex;
+    protected int chunkIndex;
     // the most relevant exception encountered for the current chunk.
     protected RouterException chunkException;
     // For a GetChunk, responses may be handled multiple times. Regardless of the successTarget,
@@ -429,11 +468,20 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
     }
 
     /**
+     * Return the {@link MessageFormatFlags} to associate with a getBlob chunk operation.
+     * @return {@link MessageFormatFlags#Blob}
+     */
+    MessageFormatFlags getOperationFlag() {
+      return MessageFormatFlags.Blob;
+    }
+
+    /**
      * Reset the state of this GetChunk.
      */
     void reset() {
       chunkOperationTracker = null;
       chunkCompleted = false;
+      retainChunkExceptionOnSuccess = false;
       chunkBlobId = null;
       chunkIndex = -1;
       chunkException = null;
@@ -465,7 +513,8 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
     }
 
     /**
-     * This is one of two main entry points to this class, the other being {@link #handleResponse(ResponseInfo)}.
+     * This is one of two main entry points to this class, the other being
+     * {@link #handleResponse(ResponseInfo, GetResponse)}.
      * Apart from fetching requests to send out, this also checks for timeouts of issued requests,
      * status of the operation and anything else that needs to be done within this GetChunk. The callers guarantee
      * that this method is called on the GetChunks of an operation until either the operation, or the chunk operation
@@ -493,7 +542,10 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
         Map.Entry<Integer, GetRequestInfo> entry = inFlightRequestsIterator.next();
         if (time.milliseconds() - entry.getValue().startTimeMs > routerConfig.routerRequestTimeoutMs) {
           onErrorResponse(entry.getValue().replicaId);
-          chunkException = new RouterException("Timed out waiting for responses", RouterErrorCode.OperationTimedOut);
+          // Do not notify this as a failure to the response handler, as this timeout could simply be due to
+          // connection unavailability. If there is indeed a network error, the NetworkClient will provide an error
+          // response and the response handler will be notified accordingly.
+          chunkException = new RouterException("Timed out waiting for a response", RouterErrorCode.OperationTimedOut);
           inFlightRequestsIterator.remove();
         } else {
           // the entries are ordered by correlation id and time. Break on the first request that has not timed out.
@@ -513,7 +565,7 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
         String hostname = replicaId.getDataNodeId().getHostname();
         Port port = replicaId.getDataNodeId().getPortToConnectTo();
         GetRequest getRequest = createGetRequest(chunkBlobId, getOperationFlag(), getGetOptions());
-        RequestInfo request = new RequestInfo(hostname, port, getRequest);
+        RouterRequestInfo request = new RouterRequestInfo(hostname, port, getRequest, replicaId);
         int correlationId = getRequest.getCorrelationId();
         correlationIdToGetRequestInfo.put(correlationId, new GetRequestInfo(replicaId, time.milliseconds()));
         correlationIdToGetChunk.put(correlationId, this);
@@ -532,14 +584,14 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
      */
     void checkAndMaybeComplete() {
       if (chunkOperationTracker.isDone()) {
-        if (chunkOperationTracker.hasSucceeded()) {
-          // override any previously set exceptions.
+        if (!retainChunkExceptionOnSuccess && chunkOperationTracker.hasSucceeded()) {
+          // override any previously set exceptions
           chunkException = null;
         }
         chunkCompleted = true;
       }
       if (chunkCompleted) {
-        operationException.set(chunkException);
+        setOperationException(chunkException);
         state = ChunkState.Complete;
       }
     }
@@ -554,7 +606,7 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
         throws IOException, MessageFormatException {
       if (!successfullyDeserialized) {
         BlobData blobData = MessageFormatRecord.deserializeBlob(payload);
-        chunkIndexToBuffer.put(chunkIndex, blobData.getStream().getByteBuffer());
+        chunkIndexToBuffer.put(chunkIndex, filterChunkToRange(blobData));
         numChunksRetrieved++;
         successfullyDeserialized = true;
       } else {
@@ -569,9 +621,10 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
      * Finally, a check is done to determine whether the operation on the chunk is eligible for completion,
      * if so the chunk operation is completed right away.
      * @param responseInfo the response received for a request sent out on behalf of this chunk.
+     * @param getResponse the {@link GetResponse} associated with this response.
      */
-    void handleResponse(ResponseInfo responseInfo) {
-      int correlationId = ((GetRequest) responseInfo.getRequest()).getCorrelationId();
+    void handleResponse(ResponseInfo responseInfo, GetResponse getResponse) {
+      int correlationId = ((GetRequest) responseInfo.getRequestInfo().getRequest()).getCorrelationId();
       // Get the GetOperation that generated the request.
       GetRequestInfo getRequestInfo = correlationIdToGetRequestInfo.remove(correlationId);
       if (getRequestInfo == null) {
@@ -584,12 +637,13 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
           .update(requestLatencyMs);
       if (responseInfo.getError() != null) {
         chunkException = new RouterException("Operation timed out", RouterErrorCode.OperationTimedOut);
-        responseHandler.onRequestResponseException(getRequestInfo.replicaId, new IOException("NetworkClient error"));
         onErrorResponse(getRequestInfo.replicaId);
       } else {
-        try {
-          GetResponse getResponse = GetResponse
-              .readFrom(new DataInputStream(new ByteBufferInputStream(responseInfo.getResponse())), clusterMap);
+        if (getResponse == null) {
+          chunkException = new RouterException("Response deserialization received an unexpected error",
+              RouterErrorCode.UnexpectedInternalError);
+          onErrorResponse(getRequestInfo.replicaId);
+        } else {
           if (getResponse.getCorrelationId() != correlationId) {
             // The NetworkClient associates a response with a request based on the fact that only one request is sent
             // out over a connection id, and the response received on a connection id must be for the latest request
@@ -603,14 +657,17 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
             onErrorResponse(getRequestInfo.replicaId);
             // we do not notify the ResponseHandler responsible for failure detection as this is an unexpected error.
           } else {
-            processGetBlobResponse(getRequestInfo, getResponse);
+            try {
+              processGetBlobResponse(getRequestInfo, getResponse);
+            } catch (IOException | MessageFormatException e) {
+              // This should really not happen. Again, we do not notify the ResponseHandler responsible for failure
+              // detection.
+              routerMetrics.responseDeserializationErrorCount.inc();
+              chunkException = new RouterException("Response deserialization received an unexpected error", e,
+                  RouterErrorCode.UnexpectedInternalError);
+              onErrorResponse(getRequestInfo.replicaId);
+            }
           }
-        } catch (IOException | MessageFormatException e) {
-          // This should really not happen. Again, we do not notify the ResponseHandler responsible for failure
-          // detection.
-          chunkException = new RouterException("Response deserialization received an unexpected error", e,
-              RouterErrorCode.UnexpectedInternalError);
-          onErrorResponse(getRequestInfo.replicaId);
         }
       }
       checkAndMaybeComplete();
@@ -630,11 +687,11 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
         int partitionsInResponse = getResponse.getPartitionResponseInfoList().size();
         // Each get request issued by the router is for a single blob.
         if (partitionsInResponse != 1) {
-          chunkException = new RouterException("Unexpected number of partition responses, expected: 1, " +
-              "received: " + partitionsInResponse, RouterErrorCode.UnexpectedInternalError);
+          chunkException = new RouterException(
+              "Unexpected number of partition responses, expected: 1, " + "received: " + partitionsInResponse,
+              RouterErrorCode.UnexpectedInternalError);
         } else {
           getError = getResponse.getPartitionResponseInfoList().get(0).getErrorCode();
-          responseHandler.onRequestResponseError(getRequestInfo.replicaId, getError);
           if (getError == ServerErrorCode.No_Error) {
             handleBody(getResponse.getInputStream());
             chunkOperationTracker.onResponse(getRequestInfo.replicaId, true);
@@ -656,7 +713,6 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
           }
         }
       } else {
-        responseHandler.onRequestResponseError(getRequestInfo.replicaId, getError);
         onErrorResponse(getRequestInfo.replicaId);
       }
     }
@@ -693,6 +749,29 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
           || exception.getErrorCode() == RouterErrorCode.BlobExpired) {
         chunkException = exception;
       }
+    }
+
+    /**
+     * Slice this chunk's data to only include the bytes within the operation's specified byte range.
+     * @param blobData the {@link BlobData} for this chunk.
+     * @return A {@link ByteBuffer} that only includes bytes within the operation's specified byte range.
+     */
+    protected ByteBuffer filterChunkToRange(BlobData blobData) {
+      ByteBuffer buf = blobData.getStream().getByteBuffer();
+      if (options == null || options.getRange() == null) {
+        return buf;
+      }
+      if (resolvedByteRange.getRangeSize() == 0) {
+        buf.position(0);
+        buf.limit(0);
+      } else {
+        long startOffsetInThisChunk = chunkIndex == 0 ? resolvedByteRange.getStartOffset() % chunkSize : 0;
+        long endOffsetInThisChunk =
+            chunkIndex == (numChunksTotal - 1) ? (resolvedByteRange.getEndOffset() % chunkSize) + 1 : chunkSize;
+        buf.position((int) startOffsetInThisChunk);
+        buf.limit((int) endOffsetInThisChunk);
+      }
+      return buf.slice();
     }
 
     /**
@@ -755,6 +834,17 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
     }
 
     /**
+     * Return the {@link MessageFormatFlags} to associate with the first getBlob chunk operation.
+     * @return {@link MessageFormatFlags#Blob} for {@link GetBlobOptions.OperationType#Data}, or {@link MessageFormatFlags#All} by
+     *         default.
+     */
+    @Override
+    MessageFormatFlags getOperationFlag() {
+      return options.getOperationType() == GetBlobOptions.OperationType.Data ? MessageFormatFlags.Blob
+          : MessageFormatFlags.All;
+    }
+
+    /**
      * {@inheritDoc}
      * <br>
      * It would help to keep in mind while going through this method that the first chunk is either a metadata chunk
@@ -764,25 +854,20 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
     void handleBody(InputStream payload)
         throws IOException, MessageFormatException {
       if (!successfullyDeserialized) {
-        BlobData blobData = MessageFormatRecord.deserializeBlob(payload);
+        BlobData blobData;
+        if (getOperationFlag() == MessageFormatFlags.Blob) {
+          blobData = MessageFormatRecord.deserializeBlob(payload);
+        } else {
+          BlobAll blobAll = MessageFormatRecord.deserializeBlobAll(payload, blobIdFactory);
+          blobInfo = blobAll.getBlobInfo();
+          blobData = blobAll.getBlobData();
+        }
         BlobType blobType = blobData.getBlobType();
         chunkIndexToBuffer = new TreeMap<>();
         if (blobType == BlobType.MetadataBlob) {
-          ByteBuffer serializedMetadataContent = blobData.getStream().getByteBuffer();
-          List<StoreKey> keys =
-              MetadataContentSerDe.deserializeMetadataContentRecord(serializedMetadataContent, blobIdFactory);
-          chunkIdIterator = keys.listIterator();
-          numChunksTotal = keys.size();
-          dataChunks = new GetChunk[Math.min(keys.size(), NonBlockingRouter.MAX_IN_MEM_CHUNKS)];
-          for (int i = 0; i < dataChunks.length; i++) {
-            dataChunks[i] = new GetChunk(chunkIdIterator.nextIndex(), (BlobId) chunkIdIterator.next());
-          }
+          handleMetadataBlob(blobData);
         } else {
-          chunkIdIterator = null;
-          numChunksTotal = 1;
-          dataChunks = null;
-          chunkIndexToBuffer.put(0, blobData.getStream().getByteBuffer());
-          numChunksRetrieved = 1;
+          handleSimpleBlob(blobData);
         }
         successfullyDeserialized = true;
         state = ChunkState.Complete;
@@ -818,6 +903,84 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
           break;
       }
     }
+
+    /**
+     * Process a metadata blob to find the data chunks that need to be fetched.
+     * @param blobData the metadata blob's data.
+     * @throws IOException
+     * @throws MessageFormatException
+     */
+    private void handleMetadataBlob(BlobData blobData)
+        throws IOException, MessageFormatException {
+      ByteBuffer serializedMetadataContent = blobData.getStream().getByteBuffer();
+      CompositeBlobInfo compositeBlobInfo =
+          MetadataContentSerDe.deserializeMetadataContentRecord(serializedMetadataContent, blobIdFactory);
+      chunkSize = compositeBlobInfo.getChunkSize();
+      totalSize = compositeBlobInfo.getTotalSize();
+      List<StoreKey> keys = compositeBlobInfo.getKeys();
+      boolean rangeResolutionFailure = false;
+      try {
+        if (options != null && options.getRange() != null) {
+          resolvedByteRange = options.getRange().toResolvedByteRange(totalSize);
+          // Get only the chunks within the range.
+          int firstChunkIndexInRange = (int) (resolvedByteRange.getStartOffset() / chunkSize);
+          int lastChunkIndexInRange = (int) (resolvedByteRange.getEndOffset() / chunkSize);
+          keys = keys.subList(firstChunkIndexInRange, lastChunkIndexInRange + 1);
+        }
+      } catch (IllegalArgumentException e) {
+        onInvalidRange(e);
+        rangeResolutionFailure = true;
+      }
+      if (!rangeResolutionFailure) {
+        chunkIdIterator = keys.listIterator();
+        numChunksTotal = keys.size();
+        dataChunks = new GetChunk[Math.min(keys.size(), NonBlockingRouter.MAX_IN_MEM_CHUNKS)];
+        for (int i = 0; i < dataChunks.length; i++) {
+          dataChunks[i] = new GetChunk(chunkIdIterator.nextIndex(), (BlobId) chunkIdIterator.next());
+        }
+      }
+    }
+
+    /**
+     * Process a simple blob and extract the requested data from the blob.
+     * @param blobData the simple blob's data
+     */
+    private void handleSimpleBlob(BlobData blobData) {
+      totalSize = blobData.getSize();
+      chunkSize = totalSize;
+      boolean rangeResolutionFailure = false;
+      try {
+        if (options != null && options.getRange() != null) {
+          resolvedByteRange = options.getRange().toResolvedByteRange(totalSize);
+        }
+      } catch (IllegalArgumentException e) {
+        onInvalidRange(e);
+        rangeResolutionFailure = true;
+      }
+      if (!rangeResolutionFailure) {
+        chunkIdIterator = null;
+        dataChunks = null;
+        chunkIndex = 0;
+        numChunksTotal = 1;
+        chunkIndexToBuffer.put(0, filterChunkToRange(blobData));
+        numChunksRetrieved = 1;
+      }
+    }
+
+    /**
+     * On an invalid range, set a {@link RouterErrorCode#RangeNotSatisfiable} exception for this chunk, mark the chunk
+     * as unconditionally completed, and set the chunk counters such that the operation will be completed.
+     * @param exception the reason that the range was invalid.
+     */
+    private void onInvalidRange(Exception exception) {
+      setChunkException(
+          new RouterException("Range provided was not satisfiable.", exception, RouterErrorCode.RangeNotSatisfiable));
+      retainChunkExceptionOnSuccess = true;
+      chunkIdIterator = null;
+      dataChunks = null;
+      numChunksTotal = 0;
+      numChunksRetrieved = 0;
+    }
   }
 
   /**
@@ -828,14 +991,17 @@ class GetBlobOperation extends GetOperation<ReadableStreamChannel> {
      * The GetChunk is free and can be assigned to hold a chunk of the overall blob.
      */
     Free,
+
     /**
      * The GetChunk has been assigned to get and hold a chunk of the overall blob.
      */
     Ready,
+
     /**
      * The GetChunk has issued requests and the operation on the chunk it holds is in progress.
      */
     InProgress,
+
     /**
      * The GetChunk is complete.
      */

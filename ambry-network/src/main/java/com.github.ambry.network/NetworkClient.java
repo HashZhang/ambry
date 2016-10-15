@@ -30,7 +30,7 @@ import org.slf4j.LoggerFactory;
 
 /**
  * The NetworkClient provides a method for sending a list of requests in the form of {@link Send} to a host:port,
- * and receive responses for sent requests. Requests that come in via {@link #sendAndPoll(List)} call,
+ * and receive responses for sent requests. Requests that come in via {@link #sendAndPoll(List, int)} call,
  * that could not be immediately sent is queued and an attempt will be made in subsequent invocations of the call (or
  * until they time out).
  * (Note: We will empirically determine whether, rather than queueing a request,
@@ -47,10 +47,9 @@ public class NetworkClient implements Closeable {
   private final Time time;
   private final LinkedList<RequestMetadata> pendingRequests;
   private final HashMap<String, RequestMetadata> connectionIdToRequestInFlight;
+  private final HashMap<String, RequestMetadata> pendingConnectionsToAssociatedRequests;
   private final AtomicLong numPendingRequests;
   private final int checkoutTimeoutMs;
-  // @todo: this needs to be empirically determined.
-  private final int POLL_TIMEOUT_MS = 1;
   private boolean closed = false;
   private static final Logger logger = LoggerFactory.getLogger(NetworkClient.class);
 
@@ -73,31 +72,31 @@ public class NetworkClient implements Closeable {
     this.networkMetrics = networkMetrics;
     this.checkoutTimeoutMs = checkoutTimeoutMs;
     this.time = time;
-    pendingRequests = new LinkedList<RequestMetadata>();
+    pendingRequests = new LinkedList<>();
     numPendingRequests = new AtomicLong(0);
-    connectionIdToRequestInFlight = new HashMap<String, RequestMetadata>();
+    connectionIdToRequestInFlight = new HashMap<>();
+    pendingConnectionsToAssociatedRequests = new HashMap<>();
     networkMetrics.registerNetworkClientPendingConnections(numPendingRequests);
   }
 
   /**
-   * Attempt to send the given requests and poll for responses from the network. Any requests that could not be
-   * sent out will be added to a queue. Every time this method is called, it will first attempt sending the requests
-   * in the queue (or time them out) and then attempt sending the newly added requests.
+   * Attempt to send the given requests and poll for responses from the network via the associated selector. Any
+   * requests that could not be sent out will be added to a queue. Every time this method is called, it will first
+   * attempt sending the requests in the queue (or time them out) and then attempt sending the newly added requests.
    * @param requestInfos the list of {@link RequestInfo} representing the requests that need to be sent out. This
    *                     could be empty.
+   * @param pollTimeoutMs the poll timeout.
    * @return a list of {@link ResponseInfo} representing the responses received for any requests that were sent out
    * so far.
-   * @throws IOException if the {@link Selector} associated with this NetworkClient throws
    * @throws IllegalStateException if the NetworkClient is closed.
    */
-  public List<ResponseInfo> sendAndPoll(List<RequestInfo> requestInfos)
-      throws IOException {
+  public List<ResponseInfo> sendAndPoll(List<RequestInfo> requestInfos, int pollTimeoutMs) {
+    if (closed || !selector.isOpen()) {
+      throw new IllegalStateException("The NetworkClient is closed.");
+    }
     long startTime = time.milliseconds();
+    List<ResponseInfo> responseInfoList = new ArrayList<>();
     try {
-      if (closed) {
-        throw new IllegalStateException("The NetworkClient is closed.");
-      }
-      List<ResponseInfo> responseInfoList = new ArrayList<ResponseInfo>();
       for (RequestInfo requestInfo : requestInfos) {
         ClientNetworkRequestMetrics clientNetworkRequestMetrics =
             new ClientNetworkRequestMetrics(networkMetrics.requestQueueTime, networkMetrics.requestSendTime,
@@ -105,14 +104,16 @@ public class NetworkClient implements Closeable {
         pendingRequests.add(new RequestMetadata(time.milliseconds(), requestInfo, clientNetworkRequestMetrics));
       }
       List<NetworkSend> sends = prepareSends(responseInfoList);
-      selector.poll(POLL_TIMEOUT_MS, sends);
+      selector.poll(pollTimeoutMs, sends);
       handleSelectorEvents(responseInfoList);
-      return responseInfoList;
+    } catch (Exception e) {
+      logger.error("Received an unexpected error during sendAndPoll(): ", e);
+      networkMetrics.networkClientException.inc();
     } finally {
       numPendingRequests.set(pendingRequests.size());
       networkMetrics.networkClientSendAndPollTime.update(time.milliseconds() - startTime);
-      logger.trace("Completing a send and poll cycle ");
     }
+    return responseInfoList;
   }
 
   /**
@@ -124,17 +125,22 @@ public class NetworkClient implements Closeable {
    * @return the list of {@link NetworkSend} objects to hand over to the Selector.
    */
   private List<NetworkSend> prepareSends(List<ResponseInfo> responseInfoList) {
-    List<NetworkSend> sends = new ArrayList<NetworkSend>();
+    List<NetworkSend> sends = new ArrayList<>();
     ListIterator<RequestMetadata> iter = pendingRequests.listIterator();
 
     /* Drop requests that have waited too long */
     while (iter.hasNext()) {
       RequestMetadata requestMetadata = iter.next();
       if (time.milliseconds() - requestMetadata.requestQueuedAtMs > checkoutTimeoutMs) {
-        responseInfoList.add(
-            new ResponseInfo(requestMetadata.requestInfo.getRequest(), NetworkClientErrorCode.ConnectionUnavailable,
-                null));
+        responseInfoList
+            .add(new ResponseInfo(requestMetadata.requestInfo, NetworkClientErrorCode.ConnectionUnavailable, null));
+        logger.trace("Failing request to host {} port {} due to connection unavailability",
+            requestMetadata.requestInfo.getHost(), requestMetadata.requestInfo.getPort());
         iter.remove();
+        if (requestMetadata.pendingConnectionId != null) {
+          pendingConnectionsToAssociatedRequests.remove(requestMetadata.pendingConnectionId);
+          requestMetadata.pendingConnectionId = null;
+        }
         networkMetrics.connectionTimeOutError.inc();
       } else {
         // Since requests are ordered by time, once the first request that cannot be dropped is found,
@@ -152,13 +158,19 @@ public class NetworkClient implements Closeable {
         Port port = requestMetadata.requestInfo.getPort();
         String connId = connectionTracker.checkOutConnection(host, port);
         if (connId == null) {
-          if (connectionTracker.mayCreateNewConnection(host, port)) {
+          if (requestMetadata.pendingConnectionId == null && connectionTracker.mayCreateNewConnection(host, port)) {
             connId = selector.connect(new InetSocketAddress(host, port.getPort()), networkConfig.socketSendBufferBytes,
                 networkConfig.socketReceiveBufferBytes, port.getPortType());
             connectionTracker.startTrackingInitiatedConnection(host, port, connId);
-            logger.trace("Initiated a connection to {}:{} ", host, port);
+            requestMetadata.pendingConnectionId = connId;
+            pendingConnectionsToAssociatedRequests.put(connId, requestMetadata);
+            logger.trace("Initiated a connection to host {} port {} ", host, port);
           }
         } else {
+          if (requestMetadata.pendingConnectionId != null) {
+            pendingConnectionsToAssociatedRequests.remove(requestMetadata.pendingConnectionId);
+            requestMetadata.pendingConnectionId = null;
+          }
           logger.trace("Connection checkout succeeded for {}:{} with connectionId {} ", host, port, connId);
           sends.add(new NetworkSend(connId, requestMetadata.requestInfo.getRequest(),
               requestMetadata.clientNetworkRequestMetrics, time));
@@ -184,15 +196,29 @@ public class NetworkClient implements Closeable {
     for (String connId : selector.connected()) {
       logger.trace("Checking in connection back to connection tracker for connectionId {} ", connId);
       connectionTracker.checkInConnection(connId);
+      pendingConnectionsToAssociatedRequests.remove(connId);
     }
 
     for (String connId : selector.disconnected()) {
-      logger.trace("Connection disconnected for connectionId {} and hence removing it from connection tracker", connId);
+      logger.trace("ConnectionId {} disconnected, removing it from connection tracker", connId);
       connectionTracker.removeConnection(connId);
-      RequestMetadata requestMetadata = connectionIdToRequestInFlight.remove(connId);
+      // If this was a pending connection and if there is a request that initiated this connection,
+      // mark the corresponding request as failed.
+      RequestMetadata requestMetadata = pendingConnectionsToAssociatedRequests.remove(connId);
       if (requestMetadata != null) {
-        responseInfoList.add(
-            new ResponseInfo(requestMetadata.requestInfo.getRequest(), NetworkClientErrorCode.NetworkError, null));
+        logger.trace("Pending connectionId {} disconnected", connId);
+        pendingRequests.remove(requestMetadata);
+        requestMetadata.pendingConnectionId = null;
+        responseInfoList.add(new ResponseInfo(requestMetadata.requestInfo, NetworkClientErrorCode.NetworkError, null));
+      } else {
+        // If this was an established connection and if there is a request in flight on this connection,
+        // mark the corresponding request as failed.
+        requestMetadata = connectionIdToRequestInFlight.remove(connId);
+        if (requestMetadata != null) {
+          logger.trace("ConnectionId {} with request in flight disconnected", connId);
+          responseInfoList
+              .add(new ResponseInfo(requestMetadata.requestInfo, NetworkClientErrorCode.NetworkError, null));
+        }
       }
     }
 
@@ -202,8 +228,7 @@ public class NetworkClient implements Closeable {
           connId);
       connectionTracker.checkInConnection(connId);
       RequestMetadata requestMetadata = connectionIdToRequestInFlight.remove(connId);
-      responseInfoList.add(
-          new ResponseInfo(requestMetadata.requestInfo.getRequest(), null, recv.getReceivedBytes().getPayload()));
+      responseInfoList.add(new ResponseInfo(requestMetadata.requestInfo, null, recv.getReceivedBytes().getPayload()));
       requestMetadata.onResponseReceive();
     }
   }
@@ -219,6 +244,16 @@ public class NetworkClient implements Closeable {
   }
 
   /**
+   * Wake up the NetworkClient if it is within a {@link #sendAndPoll(List, int)} sleep. This wakes
+   * up the {@link Selector}, which in turn wakes up the {@link java.nio.channels.Selector}.
+   * <br>
+   * @see java.nio.channels.Selector#wakeup()
+   */
+  public void wakeup() {
+    selector.wakeup();
+  }
+
+  /**
    * A class that consists of a {@link RequestInfo} and some metadata related to the request
    */
   private class RequestMetadata {
@@ -230,12 +265,22 @@ public class NetworkClient implements Closeable {
     private long requestQueuedAtMs;
     // the time at which this request was sent(or moved from queue to in flight state)
     private long requestDequeuedAtMs;
+    // if non-null, this is the connection that was initiated (and not established) on behalf of this request. This
+    // information is kept so that the NetworkClient does not keep initiating new connections for the same request, and
+    // so that in case this connection establishment fails, the request is failed immediately.
+    // Note that this is not necessarily the connection on which this request is sent eventually. This is because
+    // if another connection to the same destination becomes available before this pending connection is established,
+    // then the request will be sent on it. Similarly, if this connection gets established before a previously
+    // initiated connection for an earlier request in the queue, then in the next iteration, the earlier request could
+    // check out this connection. This, however, does not affect correctness.
+    private String pendingConnectionId;
 
     RequestMetadata(long requestQueuedAtMs, RequestInfo requestInfo,
         ClientNetworkRequestMetrics clientNetworkRequestMetrics) {
       this.requestInfo = requestInfo;
       this.requestQueuedAtMs = requestQueuedAtMs;
       this.clientNetworkRequestMetrics = clientNetworkRequestMetrics;
+      this.pendingConnectionId = null;
     }
 
     /**

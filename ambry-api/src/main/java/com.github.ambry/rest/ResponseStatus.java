@@ -30,7 +30,10 @@ public enum ResponseStatus {
    * 202 - Request was accepted.
    */
   Accepted,
-
+  /**
+   * 206 - Partial content.
+   */
+  PartialContent,
   // 3xx
   /**
    * 304 Not Modified
@@ -61,6 +64,10 @@ public enum ResponseStatus {
    * 410 Gone - Resource has been deleted or has expired.
    */
   Gone,
+  /**
+   * 416 Range Not Satisfiable - A range request is invalid or outside of the bounds of an object.
+   */
+  RangeNotSatisfiable,
 
   // 5xx
   /**
@@ -84,9 +91,7 @@ public enum ResponseStatus {
       case InvalidRequestState:
       case MalformedRequest:
       case MissingArgs:
-      case UnknownHttpObject:
       case UnsupportedHttpMethod:
-      case UnsupportedOperation:
         return ResponseStatus.BadRequest;
       case ResourceDirty:
         return ResponseStatus.Forbidden;
@@ -94,12 +99,12 @@ public enum ResponseStatus {
         return ResponseStatus.Unauthorized;
       case ResourceScanInProgress:
         return ResponseStatus.ProxyAuthenticationRequired;
+      case RangeNotSatisfiable:
+        return ResponseStatus.RangeNotSatisfiable;
       case IdConverterServiceError:
       case InternalServerError:
-      case InternalObjectCreationError:
       case RequestChannelClosed:
       case RequestResponseQueuingFailure:
-      case ResponseBuildingFailure:
       case ServiceUnavailable:
       case UnsupportedRestMethod:
       default:

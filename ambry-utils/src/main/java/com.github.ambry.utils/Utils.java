@@ -26,6 +26,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Properties;
@@ -57,8 +58,8 @@ public class Utils {
   public static String readShortString(DataInputStream input)
       throws IOException {
     Short size = input.readShort();
-    if (size <= 0) {
-      return null;
+    if (size < 0) {
+      throw new IllegalArgumentException("readShortString : the size cannot be negative");
     }
     byte[] bytes = new byte[size];
     int read = 0;
@@ -83,9 +84,21 @@ public class Utils {
    */
   public static String readIntString(DataInputStream input)
       throws IOException {
+    return readIntString(input, StandardCharsets.UTF_8);
+  }
+
+  /**
+   * Reads a String whose length is an int from the given input stream
+   * @param input The input stream from which to read the String from
+   * @param charset the charset to use.
+   * @return The String read from the stream
+   * @throws IOException
+   */
+  public static String readIntString(DataInputStream input, Charset charset)
+      throws IOException {
     int size = input.readInt();
-    if (size <= 0) {
-      return null;
+    if (size < 0) {
+      throw new IllegalArgumentException("readIntString : the size cannot be negative");
     }
     byte[] bytes = new byte[size];
     int read = 0;
@@ -99,7 +112,7 @@ public class Utils {
     if (read != size) {
       throw new IllegalArgumentException("readIntString : the size of the input does not match the actual data size");
     }
-    return new String(bytes, "UTF-8");
+    return new String(bytes, charset);
   }
 
   /**
@@ -112,7 +125,7 @@ public class Utils {
       throws IOException {
     int size = input.readInt();
     if (size < 0) {
-      return null;
+      throw new IllegalArgumentException("readIntBuffer : the size cannot be negative");
     }
     ByteBuffer buffer = ByteBuffer.allocate(size);
     int read = 0;
@@ -139,7 +152,7 @@ public class Utils {
       throws IOException {
     short size = input.readShort();
     if (size < 0) {
-      return null;
+      throw new IllegalArgumentException("readShortBuffer : the size cannot be negative");
     }
     ByteBuffer buffer = ByteBuffer.allocate(size);
     int read = 0;
@@ -526,10 +539,19 @@ public class Utils {
     return new JSONObject(readStringFromFile(path));
   }
 
+  /**
+   * Ensures that a given File is present. The file is pre-allocated with a given capacity using fallocate on linux
+   * @param file file path to create and allocate
+   * @param capacityBytes the number of bytes to pre-allocate
+   * @throws IOException
+   */
   public static void preAllocateFileIfNeeded(File file, long capacityBytes)
       throws IOException {
-    Runtime runtime = Runtime.getRuntime();
+    if (!file.exists()) {
+      file.createNewFile();
+    }
     if (System.getProperty("os.name").toLowerCase().startsWith("linux")) {
+      Runtime runtime = Runtime.getRuntime();
       Process process = runtime.exec("fallocate --keep-size -l " + capacityBytes + " " + file.getAbsolutePath());
       try {
         process.waitFor();
@@ -540,15 +562,6 @@ public class Utils {
         throw new IOException("error while trying to preallocate file " + file.getAbsolutePath() +
             " exitvalue " + process.exitValue() +
             " error string " + process.getErrorStream());
-      }
-    } else {
-      RandomAccessFile rfile = null;
-      try {
-        rfile = new RandomAccessFile(file, "rw");
-      } finally {
-        if (rfile != null) {
-          rfile.close();
-        }
       }
     }
   }

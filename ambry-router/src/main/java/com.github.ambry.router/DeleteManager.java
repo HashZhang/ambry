@@ -14,15 +14,20 @@
 package com.github.ambry.router;
 
 import com.github.ambry.clustermap.ClusterMap;
+import com.github.ambry.clustermap.ReplicaId;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.ResponseHandler;
 import com.github.ambry.config.RouterConfig;
+import com.github.ambry.network.NetworkClientErrorCode;
 import com.github.ambry.network.RequestInfo;
 import com.github.ambry.network.ResponseInfo;
 import com.github.ambry.notification.NotificationSystem;
 import com.github.ambry.protocol.DeleteRequest;
+import com.github.ambry.protocol.DeleteResponse;
 import com.github.ambry.protocol.RequestOrResponse;
+import com.github.ambry.utils.ByteBufferInputStream;
 import com.github.ambry.utils.Time;
+import java.io.DataInputStream;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -104,8 +109,7 @@ class DeleteManager {
       deleteOperations.add(deleteOperation);
     } catch (RouterException e) {
       routerMetrics.operationDequeuingRate.mark();
-      routerMetrics.deleteBlobErrorCount.inc();
-      routerMetrics.countError(e);
+      routerMetrics.onDeleteBlobError(e);
       operationCompleteCallback.completeOperation(futureResult, callback, null, e);
     }
   }
@@ -144,13 +148,15 @@ class DeleteManager {
    */
   void handleResponse(ResponseInfo responseInfo) {
     long startTime = time.milliseconds();
-    int correlationId = ((DeleteRequest) responseInfo.getRequest()).getCorrelationId();
+    DeleteResponse deleteReponse = extractDeleteResponseAndNotifyResponseHandler(responseInfo);
+    RouterRequestInfo routerRequestInfo = (RouterRequestInfo) responseInfo.getRequestInfo();
+    int correlationId = ((DeleteRequest) routerRequestInfo.getRequest()).getCorrelationId();
     DeleteOperation deleteOperation = correlationIdToDeleteOperation.remove(correlationId);
     // If it is still an active operation, hand over the response. Otherwise, ignore.
     if (deleteOperations.contains(deleteOperation)) {
       boolean exceptionEncountered = false;
       try {
-        deleteOperation.handleResponse(responseInfo);
+        deleteOperation.handleResponse(responseInfo, deleteReponse);
       } catch (Exception e) {
         exceptionEncountered = true;
         deleteOperation.setOperationException(
@@ -169,6 +175,31 @@ class DeleteManager {
   }
 
   /**
+   * Extract the {@link DeleteResponse} from the given {@link ResponseInfo}
+   * @param responseInfo the {@link ResponseInfo} from which the {@link DeleteResponse} is to be extracted.
+   * @return the extracted {@link DeleteResponse} if there is one; null otherwise.
+   */
+  private DeleteResponse extractDeleteResponseAndNotifyResponseHandler(ResponseInfo responseInfo) {
+    DeleteResponse deleteResponse = null;
+    ReplicaId replicaId = ((RouterRequestInfo) responseInfo.getRequestInfo()).getReplicaId();
+    NetworkClientErrorCode networkClientErrorCode = responseInfo.getError();
+    if (networkClientErrorCode == null) {
+      try {
+        deleteResponse =
+            DeleteResponse.readFrom(new DataInputStream(new ByteBufferInputStream(responseInfo.getResponse())));
+        responseHandler.onEvent(replicaId, deleteResponse.getError());
+      } catch (Exception e) {
+        // Ignore. There is no value in notifying the response handler.
+        logger.error("Response deserialization received unexpected error", e);
+        routerMetrics.responseDeserializationErrorCount.inc();
+      }
+    } else {
+      responseHandler.onEvent(replicaId, networkClientErrorCode);
+    }
+    return deleteResponse;
+  }
+
+  /**
    * Called when the delete operation is completed. The {@code DeleteManager} also finishes the delete operation
    * by performing the callback and notification.
    * @param op The {@link DeleteOperation} that has completed.
@@ -178,8 +209,7 @@ class DeleteManager {
     if (e == null) {
       notificationSystem.onBlobDeleted(op.getBlobId().getID());
     } else {
-      routerMetrics.deleteBlobErrorCount.inc();
-      routerMetrics.countError(e);
+      routerMetrics.onDeleteBlobError(e);
     }
     routerMetrics.operationDequeuingRate.mark();
     routerMetrics.deleteBlobOperationLatencyMs.update(time.milliseconds() - op.getSubmissionTimeMs());
@@ -200,8 +230,7 @@ class DeleteManager {
         Exception e = new RouterException("Aborted operation because Router is closed.", RouterErrorCode.RouterClosed);
         routerMetrics.operationDequeuingRate.mark();
         routerMetrics.operationAbortCount.inc();
-        routerMetrics.deleteBlobErrorCount.inc();
-        routerMetrics.countError(e);
+        routerMetrics.onDeleteBlobError(e);
         operationCompleteCallback.completeOperation(op.getFutureResult(), op.getCallback(), null, e);
       }
     }

@@ -14,16 +14,22 @@
 package com.github.ambry.router;
 
 import com.github.ambry.clustermap.ClusterMap;
+import com.github.ambry.clustermap.ReplicaId;
+import com.github.ambry.commons.ByteBufferAsyncWritableChannel;
 import com.github.ambry.commons.ResponseHandler;
 import com.github.ambry.config.RouterConfig;
 import com.github.ambry.messageformat.BlobProperties;
+import com.github.ambry.network.NetworkClientErrorCode;
 import com.github.ambry.network.RequestInfo;
 import com.github.ambry.network.ResponseInfo;
 import com.github.ambry.notification.NotificationSystem;
 import com.github.ambry.protocol.PutRequest;
+import com.github.ambry.protocol.PutResponse;
 import com.github.ambry.protocol.RequestOrResponse;
+import com.github.ambry.utils.ByteBufferInputStream;
 import com.github.ambry.utils.Time;
 import com.github.ambry.utils.Utils;
+import java.io.DataInputStream;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -46,6 +52,9 @@ class PutManager {
   private final NotificationSystem notificationSystem;
   private final Time time;
   private final Thread chunkFillerThread;
+  private final Object chunkFillerSynchronizer = new Object();
+  private volatile boolean isChunkFillerThreadAsleep = false;
+  private volatile boolean chunkFillerThreadMaySleep = false;
   // This helps the PutManager quickly find the appropriate PutOperation to hand over the response to.
   // Requests are added before they are sent out and get cleaned up as and when responses come in.
   // Because there is a guaranteed response from the NetworkClient for every request sent out, entries
@@ -53,6 +62,9 @@ class PutManager {
   private final Map<Integer, PutOperation> correlationIdToPutOperation;
   private final AtomicBoolean isOpen = new AtomicBoolean(true);
   private final OperationCompleteCallback operationCompleteCallback;
+  private final ReadyForPollCallback readyForPollCallback;
+  private final List<String> idsToDeleteList;
+  private final ByteBufferAsyncWritableChannel.ChannelEventListener chunkArrivalListener;
 
   // shared by all PutOperations
   private final ClusterMap clusterMap;
@@ -83,18 +95,38 @@ class PutManager {
    * @param routerConfig  The {@link RouterConfig} containing the configs for the PutManager.
    * @param routerMetrics The {@link NonBlockingRouterMetrics} to be used for reporting metrics.
    * @param operationCompleteCallback The {@link OperationCompleteCallback} to use to complete operations.
+   * @param readyForPollCallback The callback to be used to notify the router of any state changes within the
+   *                             operations.
+   * @param idsToDeleteList The list to fill with ids of successfully put data chunks of an unsuccessful
+   *                        overall put operation.
    * @param index the index of the {@link NonBlockingRouter.OperationController} in the {@link NonBlockingRouter}
    * @param time The {@link Time} instance to use.
    */
   PutManager(ClusterMap clusterMap, ResponseHandler responseHandler, NotificationSystem notificationSystem,
       RouterConfig routerConfig, NonBlockingRouterMetrics routerMetrics,
-      OperationCompleteCallback operationCompleteCallback, int index, Time time) {
+      OperationCompleteCallback operationCompleteCallback, ReadyForPollCallback readyForPollCallback,
+      List<String> idsToDeleteList, int index, Time time) {
     this.clusterMap = clusterMap;
     this.responseHandler = responseHandler;
     this.notificationSystem = notificationSystem;
     this.routerConfig = routerConfig;
     this.routerMetrics = routerMetrics;
     this.operationCompleteCallback = operationCompleteCallback;
+    this.readyForPollCallback = readyForPollCallback;
+    this.idsToDeleteList = idsToDeleteList;
+    this.chunkArrivalListener = new ByteBufferAsyncWritableChannel.ChannelEventListener() {
+      @Override
+      public void onEvent(ByteBufferAsyncWritableChannel.EventType e) {
+        synchronized (chunkFillerSynchronizer) {
+          // At this point, the chunk for which this notification came in (if any) could already have been consumed by
+          // the chunk filler, and this might unnecessarily wake it up from its sleep, which should be okay.
+          chunkFillerThreadMaySleep = false;
+          if (isChunkFillerThreadAsleep) {
+            chunkFillerSynchronizer.notify();
+          }
+        }
+      }
+    };
     this.time = time;
     putOperations = Collections.newSetFromMap(new ConcurrentHashMap<PutOperation, Boolean>());
     correlationIdToPutOperation = new HashMap<Integer, PutOperation>();
@@ -116,12 +148,12 @@ class PutManager {
     try {
       PutOperation putOperation =
           new PutOperation(routerConfig, routerMetrics, clusterMap, responseHandler, blobProperties, userMetaData,
-              channel, futureResult, callback, time);
+              channel, futureResult, callback, readyForPollCallback, chunkArrivalListener, time);
       putOperations.add(putOperation);
+      putOperation.startReadingFromChannel();
     } catch (RouterException e) {
       routerMetrics.operationDequeuingRate.mark();
-      routerMetrics.putBlobErrorCount.inc();
-      routerMetrics.countError(e);
+      routerMetrics.onPutBlobError(e);
       operationCompleteCallback.completeOperation(futureResult, callback, null, e);
     }
   }
@@ -159,13 +191,15 @@ class PutManager {
    */
   void handleResponse(ResponseInfo responseInfo) {
     long startTime = time.milliseconds();
-    int correlationId = ((PutRequest) responseInfo.getRequest()).getCorrelationId();
+    PutResponse putResponse = extractPutResponseAndNotifyResponseHandler(responseInfo);
+    RouterRequestInfo routerRequestInfo = (RouterRequestInfo) responseInfo.getRequestInfo();
+    int correlationId = ((PutRequest) routerRequestInfo.getRequest()).getCorrelationId();
     // Get the PutOperation that generated the request.
     PutOperation putOperation = correlationIdToPutOperation.remove(correlationId);
     // If it is still an active operation, hand over the response. Otherwise, ignore.
     if (putOperations.contains(putOperation)) {
       try {
-        putOperation.handleResponse(responseInfo);
+        putOperation.handleResponse(responseInfo, putResponse);
       } catch (Exception e) {
         putOperation.setOperationExceptionAndComplete(
             new RouterException("Put handleResponse encountered unexpected error", e,
@@ -181,10 +215,27 @@ class PutManager {
   }
 
   /**
-   * Returns a list of ids of successfully put chunks that were part of unsuccessful put operations.
+   * Extract the {@link PutResponse} from the given {@link ResponseInfo}
+   * @param responseInfo the {@link ResponseInfo} from which the {@link PutResponse} is to be extracted.
+   * @return the extracted {@link PutResponse} if there is one; null otherwise.
    */
-  void getIdsToDelete(List<String> idsToDelete) {
-    // @todo save and return ids of failed puts.
+  private PutResponse extractPutResponseAndNotifyResponseHandler(ResponseInfo responseInfo) {
+    PutResponse putResponse = null;
+    ReplicaId replicaId = ((RouterRequestInfo) responseInfo.getRequestInfo()).getReplicaId();
+    NetworkClientErrorCode networkClientErrorCode = responseInfo.getError();
+    if (networkClientErrorCode == null) {
+      try {
+        putResponse = PutResponse.readFrom(new DataInputStream(new ByteBufferInputStream(responseInfo.getResponse())));
+        responseHandler.onEvent(replicaId, putResponse.getError());
+      } catch (Exception e) {
+        // Ignore. There is no value in notifying the response handler.
+        logger.error("Response deserialization received unexpected error", e);
+        routerMetrics.responseDeserializationErrorCount.inc();
+      }
+    } else {
+      responseHandler.onEvent(replicaId, networkClientErrorCode);
+    }
+    return putResponse;
   }
 
   /**
@@ -195,17 +246,36 @@ class PutManager {
    */
   void onComplete(PutOperation op) {
     Exception e = op.getOperationException();
+    String blobId = op.getBlobIdString();
+    if (blobId == null && e == null) {
+      e = new RouterException("Operation failed, but exception was not set", RouterErrorCode.UnexpectedInternalError);
+      routerMetrics.operationFailureWithUnsetExceptionCount.inc();
+    }
     if (e != null) {
-      // @todo add blobs in the metadata chunk to ids_to_delete
-      routerMetrics.putBlobErrorCount.inc();
-      routerMetrics.countError(e);
+      blobId = null;
+      routerMetrics.onPutBlobError(e);
+      op.addSuccessfullyPutChunkIds(idsToDeleteList);
     } else {
       notificationSystem.onBlobCreated(op.getBlobIdString(), op.getBlobProperties(), op.getUserMetadata());
+      updateChunkingAndSizeMetricsOnSuccessfulPut(op);
     }
     routerMetrics.operationDequeuingRate.mark();
     routerMetrics.putBlobOperationLatencyMs.update(time.milliseconds() - op.getSubmissionTimeMs());
-    operationCompleteCallback
-        .completeOperation(op.getFuture(), op.getCallback(), op.getBlobIdString(), op.getOperationException());
+    operationCompleteCallback.completeOperation(op.getFuture(), op.getCallback(), blobId, e);
+  }
+
+  /**
+   * Update chunking and size related metrics - blob size, chunk count, and whether the blob is simple or composite.
+   * @param op the {@link PutOperation} that completed successfully.
+   */
+  private void updateChunkingAndSizeMetricsOnSuccessfulPut(PutOperation op) {
+    routerMetrics.putBlobSizeBytes.update(op.getBlobProperties().getBlobSize());
+    routerMetrics.putBlobChunkCount.update(op.getNumDataChunks());
+    if (op.getNumDataChunks() == 1) {
+      routerMetrics.simpleBlobPutCount.inc();
+    } else {
+      routerMetrics.compositeBlobPutCount.inc();
+    }
   }
 
   /**
@@ -221,6 +291,12 @@ class PutManager {
    */
   void close() {
     if (isOpen.compareAndSet(true, false)) {
+      synchronized (chunkFillerSynchronizer) {
+        if (isChunkFillerThreadAsleep) {
+          chunkFillerThreadMaySleep = false;
+          chunkFillerSynchronizer.notify();
+        }
+      }
       try {
         chunkFillerThread.join(NonBlockingRouter.SHUTDOWN_WAIT_MS);
       } catch (InterruptedException e) {
@@ -246,8 +322,7 @@ class PutManager {
         Exception e = new RouterException("Aborted operation because Router is closed.", RouterErrorCode.RouterClosed);
         routerMetrics.operationDequeuingRate.mark();
         routerMetrics.operationAbortCount.inc();
-        routerMetrics.putBlobErrorCount.inc();
-        routerMetrics.countError(e);
+        routerMetrics.onPutBlobError(e);
         operationCompleteCallback.completeOperation(op.getFuture(), op.getCallback(), null, e);
       }
     }
@@ -259,24 +334,29 @@ class PutManager {
    * by the {@link ReadableStreamChannel} associated with the operation.
    */
   private class ChunkFiller implements Runnable {
-    private final int sleepTimeWhenIdleMs = 10;
-
     public void run() {
       try {
         while (isOpen.get()) {
-          boolean allChunksFilled = true;
+          chunkFillerThreadMaySleep = true;
           for (PutOperation op : putOperations) {
             if (!op.isChunkFillComplete()) {
               op.fillChunks();
-              allChunksFilled = false;
+              chunkFillerThreadMaySleep = false;
             }
           }
-          if (allChunksFilled) {
-            Thread.sleep(sleepTimeWhenIdleMs);
+          if (chunkFillerThreadMaySleep) {
+            synchronized (chunkFillerSynchronizer) {
+              while (chunkFillerThreadMaySleep) {
+                isChunkFillerThreadAsleep = true;
+                chunkFillerSynchronizer.wait();
+              }
+              isChunkFillerThreadAsleep = false;
+            }
           }
         }
-      } catch (InterruptedException e) {
-        logger.error("ChunkFillerThread received exception", e);
+      } catch (Throwable e) {
+        logger.error("Aborting, chunkFillerThread received an unexpected error:", e);
+        routerMetrics.chunkFillerUnexpectedErrorCount.inc();
         if (isOpen.compareAndSet(true, false)) {
           completePendingOperations();
         }

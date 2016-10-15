@@ -157,9 +157,8 @@ public class AsyncRequestResponseHandlerTest {
   @Test
   public void edgeCaseWorkerCountsTest()
       throws Exception {
-    RestServerMetrics serverMetrics =
-        new RestServerMetrics(new MetricRegistry(), new RestServerState("/healthCheckUri"));
-    AsyncRequestResponseHandler requestResponseHandler = new AsyncRequestResponseHandler(serverMetrics);
+    RequestResponseHandlerMetrics metrics = new RequestResponseHandlerMetrics(new MetricRegistry());
+    AsyncRequestResponseHandler requestResponseHandler = new AsyncRequestResponseHandler(metrics);
     noRequestHandlersTest(requestResponseHandler);
 
     requestResponseHandler = getAsyncRequestResponseHandler(0);
@@ -168,9 +167,8 @@ public class AsyncRequestResponseHandlerTest {
 
   @Test
   public void setFunctionsBadArgumentsTest() {
-    RestServerMetrics serverMetrics =
-        new RestServerMetrics(new MetricRegistry(), new RestServerState("/healthCheckUri"));
-    AsyncRequestResponseHandler requestResponseHandler = new AsyncRequestResponseHandler(serverMetrics);
+    RequestResponseHandlerMetrics metrics = new RequestResponseHandlerMetrics(new MetricRegistry());
+    AsyncRequestResponseHandler requestResponseHandler = new AsyncRequestResponseHandler(metrics);
 
     // set request workers < 0
     try {
@@ -610,9 +608,8 @@ public class AsyncRequestResponseHandlerTest {
    */
   private static AsyncRequestResponseHandler getAsyncRequestResponseHandler(int requestWorkers)
       throws IOException {
-    RestServerMetrics serverMetrics =
-        new RestServerMetrics(new MetricRegistry(), new RestServerState("/healthCheckUri"));
-    AsyncRequestResponseHandler handler = new AsyncRequestResponseHandler(serverMetrics);
+    RequestResponseHandlerMetrics metrics = new RequestResponseHandlerMetrics(new MetricRegistry());
+    AsyncRequestResponseHandler handler = new AsyncRequestResponseHandler(metrics);
     if (requestWorkers > 0) {
       if (blobStorageService == null) {
         blobStorageService = new MockBlobStorageService(verifiableProperties, handler, router);
@@ -868,15 +865,6 @@ class IncompleteReadReadableStreamChannel implements ReadableStreamChannel {
       callback.onCompletion(bytesRead, exception);
     }
     return futureResult;
-  }
-
-  @Override
-  public void setDigestAlgorithm(String digestAlgorithm) {
-  }
-
-  @Override
-  public byte[] getDigest() {
-    return null;
   }
 
   @Override

@@ -21,6 +21,7 @@ import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 
@@ -33,6 +34,8 @@ public class MockClusterMap implements ClusterMap {
   private final Map<Long, PartitionId> partitions;
   private final List<MockDataNodeId> dataNodes;
   private final int numMountPointsPerNode;
+  private final HashSet<String> dataCentersInClusterMap = new HashSet<>();
+  private boolean partitionsUnavailable = false;
 
   /**
    * The default constructor sets up a 9 node cluster with 3 mount points in each, with 3 partitions/replicas per
@@ -84,10 +87,12 @@ public class MockClusterMap implements ClusterMap {
       if (i % 3 == 0) {
         dcIndex++;
       }
+      String dcName = "DC" + dcIndex;
+      dataCentersInClusterMap.add(dcName);
       if (enableSSLPorts) {
-        dataNodes.add(createDataNode(getListOfPorts(currentPlainTextPort++, currentSSLPort++), "DC" + dcIndex));
+        dataNodes.add(createDataNode(getListOfPorts(currentPlainTextPort++, currentSSLPort++), dcName));
       } else {
-        dataNodes.add(createDataNode(getListOfPorts(currentPlainTextPort++), "DC" + dcIndex));
+        dataNodes.add(createDataNode(getListOfPorts(currentPlainTextPort++), dcName));
       }
     }
     partitions = new HashMap<Long, PartitionId>();
@@ -157,15 +162,17 @@ public class MockClusterMap implements ClusterMap {
   @Override
   public List<PartitionId> getWritablePartitionIds() {
     List<PartitionId> partitionIdList = new ArrayList<PartitionId>();
-    for (PartitionId partitionId : partitions.values()) {
-      partitionIdList.add(partitionId);
+    if (!partitionsUnavailable) {
+      for (PartitionId partitionId : partitions.values()) {
+        partitionIdList.add(partitionId);
+      }
     }
     return partitionIdList;
   }
 
   @Override
   public boolean hasDatacenter(String datacenterName) {
-    return true;
+    return dataCentersInClusterMap.contains(datacenterName);
   }
 
   @Override
@@ -245,6 +252,14 @@ public class MockClusterMap implements ClusterMap {
     }
   }
 
+  /**
+   * Mark all partitions as unavailable.
+   */
+  public void markAllPartitionsUnavailable() {
+    partitionsUnavailable = true;
+  }
+
+  @Override
   public void onReplicaEvent(ReplicaId replicaId, ReplicaEventType event) {
     switch (event) {
       case Disk_Error:

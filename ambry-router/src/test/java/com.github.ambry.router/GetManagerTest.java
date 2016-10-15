@@ -47,6 +47,7 @@ public class GetManagerTest {
   // this is a reference to the state used by the mockSelector. just allows tests to manipulate the state.
   private final AtomicReference<MockSelectorState> mockSelectorState = new AtomicReference<MockSelectorState>();
   private NonBlockingRouter router;
+  private RouterConfig routerConfig;
   private int chunkSize;
   private int requestParallelism;
   private int successTarget;
@@ -55,7 +56,7 @@ public class GetManagerTest {
   private byte[] putUserMetadata;
   private byte[] putContent;
   private ReadableStreamChannel putChannel;
-
+  private GetBlobOptions options = new GetBlobOptions();
   private static final int MAX_PORTS_PLAIN_TEXT = 3;
   private static final int MAX_PORTS_SSL = 3;
   private static final int CHECKOUT_TIMEOUT_MS = 1000;
@@ -92,15 +93,7 @@ public class GetManagerTest {
   @Test
   public void testSimpleBlobGetSuccess()
       throws Exception {
-    router = getNonBlockingRouter();
-    setOperationParams(chunkSize);
-    String blobId = router.putBlob(putBlobProperties, putUserMetadata, putChannel).get();
-    BlobInfo blobInfo = router.getBlobInfo(blobId).get();
-    Assert.assertTrue("Blob properties should match",
-        RouterTestHelpers.haveEquivalentFields(putBlobProperties, blobInfo.getBlobProperties()));
-    Assert.assertArrayEquals("User metadata should match", putUserMetadata, blobInfo.getUserMetadata());
-    getBlobAndCompareContent(blobId);
-    router.close();
+    testGetSuccess(chunkSize, new GetBlobOptions());
   }
 
   /**
@@ -110,60 +103,133 @@ public class GetManagerTest {
   @Test
   public void testCompositeBlobGetSuccess()
       throws Exception {
+    testGetSuccess(chunkSize * 6 + 11, new GetBlobOptions());
+  }
+
+  /**
+   * Tests the router range request interface.
+   * @throws Exception
+   */
+  @Test
+  public void testRangeRequest()
+      throws Exception {
+    testGetSuccess(chunkSize * 6 + 11, new GetBlobOptions(GetBlobOptions.OperationType.Data,
+        ByteRange.fromOffsetRange(chunkSize * 2 + 3, chunkSize * 5 + 4)));
+  }
+
+  /**
+   * Test a get request.
+   * @param blobSize the size of the blob to put/get.
+   * @param options the {@link GetBlobOptions} for the get request.
+   */
+  private void testGetSuccess(int blobSize, GetBlobOptions options)
+      throws Exception {
     router = getNonBlockingRouter();
-    setOperationParams(chunkSize * 6 + 11);
+    setOperationParams(blobSize, options);
     String blobId = router.putBlob(putBlobProperties, putUserMetadata, putChannel).get();
-    BlobInfo blobInfo = router.getBlobInfo(blobId).get();
-    Assert.assertTrue("Blob properties should match",
-        RouterTestHelpers.haveEquivalentFields(putBlobProperties, blobInfo.getBlobProperties()));
-    Assert.assertArrayEquals("User metadata should match", putUserMetadata, blobInfo.getUserMetadata());
+    getBlobAndCompareContent(blobId);
+    // Test GetBlobInfoOperation, regardless of options passed in.
+    this.options = new GetBlobOptions(GetBlobOptions.OperationType.BlobInfo, null);
     getBlobAndCompareContent(blobId);
     router.close();
   }
 
   /**
-   * Test that a bad user defined callback will not crash the router.
+   * Test that an exception thrown in a user defined callback will not crash the router
    * @throws Exception
    */
   @Test
-  public void testBadCallback()
+  public void testCallbackRuntimeException()
+      throws Exception {
+    final CountDownLatch getBlobCallbackCalled = new CountDownLatch(1);
+    testBadCallback(new Callback<GetBlobResult>() {
+      @Override
+      public void onCompletion(GetBlobResult result, Exception exception) {
+        getBlobCallbackCalled.countDown();
+        throw new RuntimeException("Throwing an exception in the user callback");
+      }
+    }, getBlobCallbackCalled, true);
+  }
+
+  /**
+   * Test the case where async write results in an exception. Read should be notified,
+   * operation should get completed.
+   */
+  @Test
+  public void testAsyncWriteException()
+      throws Exception {
+    final CountDownLatch getBlobCallbackCalled = new CountDownLatch(1);
+    testBadCallback(new Callback<GetBlobResult>() {
+      @Override
+      public void onCompletion(final GetBlobResult result, final Exception exception) {
+        getBlobCallbackCalled.countDown();
+        AsyncWritableChannel asyncWritableChannel = new AsyncWritableChannel() {
+          boolean open = true;
+
+          @Override
+          public Future<Long> write(ByteBuffer src, Callback<Long> callback) {
+            throw new RuntimeException("This will be thrown when the channel is written to.");
+          }
+
+          @Override
+          public boolean isOpen() {
+            return open;
+          }
+
+          @Override
+          public void close()
+              throws IOException {
+            open = false;
+          }
+        };
+        result.getBlobDataChannel().readInto(asyncWritableChannel, null);
+      }
+    }, getBlobCallbackCalled, false);
+  }
+
+  /**
+   * Test that a bad user defined callback will not crash the router.
+   * @param getBlobCallback User defined callback to be called after getBlob operation.
+   * @param getBlobCallbackCalled This latch should be at 0 after {@code getBlobCallback} has been called.
+   * @param checkBadCallbackBlob {@code true} if the blob contents provided by the getBlob operation with the bad
+   *                             callback should be inspected for correctness.
+   * @throws Exception
+   */
+  private void testBadCallback(Callback<GetBlobResult> getBlobCallback, CountDownLatch getBlobCallbackCalled,
+      Boolean checkBadCallbackBlob)
       throws Exception {
     router = getNonBlockingRouter();
-    setOperationParams(chunkSize * 6 + 11);
+    setOperationParams(chunkSize * 6 + 11, new GetBlobOptions());
     final CountDownLatch getBlobInfoCallbackCalled = new CountDownLatch(1);
-    final CountDownLatch getBlobCallbackCalled = new CountDownLatch(1);
     String blobId = router.putBlob(putBlobProperties, putUserMetadata, putChannel).get();
-    List<Future<BlobInfo>> getBlobInfoFutures = new ArrayList<>();
-    List<Future<ReadableStreamChannel>> getBlobFutures = new ArrayList<>();
+    List<Future<GetBlobResult>> getBlobInfoFutures = new ArrayList<>();
+    List<Future<GetBlobResult>> getBlobDataFutures = new ArrayList<>();
+    GetBlobOptions infoOptions = new GetBlobOptions(GetBlobOptions.OperationType.BlobInfo, null);
+    GetBlobOptions dataOptions = new GetBlobOptions(GetBlobOptions.OperationType.Data, null);
     for (int i = 0; i < 5; i++) {
       if (i == 1) {
-        getBlobInfoFutures.add(router.getBlobInfo(blobId, new Callback<BlobInfo>() {
+        getBlobInfoFutures.add(router.getBlob(blobId, infoOptions, new Callback<GetBlobResult>() {
           @Override
-          public void onCompletion(BlobInfo result, Exception exception) {
+          public void onCompletion(GetBlobResult result, Exception exception) {
             getBlobInfoCallbackCalled.countDown();
             throw new RuntimeException("Throwing an exception in the user callback");
           }
         }));
-        getBlobFutures.add(router.getBlob(blobId, new Callback<ReadableStreamChannel>() {
-          @Override
-          public void onCompletion(ReadableStreamChannel result, Exception exception) {
-            getBlobCallbackCalled.countDown();
-            throw new RuntimeException("Throwing an exception in the user callback");
-          }
-        }));
+        getBlobDataFutures.add(router.getBlob(blobId, dataOptions, getBlobCallback));
       } else {
-        getBlobInfoFutures.add(router.getBlobInfo(blobId));
-        getBlobFutures.add(router.getBlob(blobId));
+        getBlobInfoFutures.add(router.getBlob(blobId, infoOptions));
+        getBlobDataFutures.add(router.getBlob(blobId, dataOptions));
       }
     }
-    for (Future<ReadableStreamChannel> future : getBlobFutures) {
-      compareContent(future.get());
+    options = dataOptions;
+    for (int i = 0; i < getBlobDataFutures.size(); i++) {
+      if (i != 1 || checkBadCallbackBlob) {
+        compareContent(getBlobDataFutures.get(i).get().getBlobDataChannel());
+      }
     }
-    for (Future<BlobInfo> future : getBlobInfoFutures) {
-      BlobInfo blobInfo = future.get();
-      Assert.assertTrue("Blob properties should match",
-          RouterTestHelpers.haveEquivalentFields(putBlobProperties, blobInfo.getBlobProperties()));
-      Assert.assertArrayEquals("User metadata should match", putUserMetadata, blobInfo.getUserMetadata());
+    options = infoOptions;
+    for (Future<GetBlobResult> future : getBlobInfoFutures) {
+      compareBlobInfo(future.get().getBlobInfo());
     }
     Assert.assertTrue("getBlobInfo callback not called.", getBlobInfoCallbackCalled.await(2, TimeUnit.SECONDS));
     Assert.assertTrue("getBlob callback not called.", getBlobCallbackCalled.await(2, TimeUnit.SECONDS));
@@ -171,12 +237,10 @@ public class GetManagerTest {
     Assert.assertTrue("Router should not be closed", router.isOpen());
 
     // Test that GetManager is still operational
-    setOperationParams(chunkSize);
+    setOperationParams(chunkSize, new GetBlobOptions());
     blobId = router.putBlob(putBlobProperties, putUserMetadata, putChannel).get();
-    BlobInfo blobInfo = router.getBlobInfo(blobId).get();
-    Assert.assertTrue("Blob properties should match",
-        RouterTestHelpers.haveEquivalentFields(putBlobProperties, blobInfo.getBlobProperties()));
-    Assert.assertArrayEquals("User metadata should match", putUserMetadata, blobInfo.getUserMetadata());
+    getBlobAndCompareContent(blobId);
+    this.options = infoOptions;
     getBlobAndCompareContent(blobId);
     router.close();
   }
@@ -190,26 +254,36 @@ public class GetManagerTest {
   public void testFailureOnAllPollThatSends()
       throws Exception {
     router = getNonBlockingRouter();
-    setOperationParams(chunkSize);
+    setOperationParams(chunkSize, new GetBlobOptions());
     String blobId = router.putBlob(putBlobProperties, putUserMetadata, putChannel).get();
     mockSelectorState.set(MockSelectorState.ThrowExceptionOnSend);
+    Future future;
     try {
-      router.getBlobInfo(blobId).get();
+      future = router.getBlob(blobId, new GetBlobOptions(GetBlobOptions.OperationType.BlobInfo, null));
+      while (!future.isDone()) {
+        mockTime.sleep(routerConfig.routerRequestTimeoutMs + 1);
+        Thread.yield();
+      }
+      future.get();
       Assert.fail("operation should have thrown");
     } catch (ExecutionException e) {
       RouterException routerException = (RouterException) e.getCause();
-      Assert.assertEquals("Exception received should be router closed error", RouterErrorCode.RouterClosed,
-          routerException.getErrorCode());
+      Assert.assertEquals(RouterErrorCode.OperationTimedOut, routerException.getErrorCode());
     }
 
     try {
-      router.getBlob(blobId).get();
+      future = router.getBlob(blobId, options);
+      while (!future.isDone()) {
+        mockTime.sleep(routerConfig.routerRequestTimeoutMs + 1);
+        Thread.yield();
+      }
+      future.get();
       Assert.fail("operation should have thrown");
     } catch (ExecutionException e) {
       RouterException routerException = (RouterException) e.getCause();
-      Assert.assertEquals("Exception received should be router closed error", RouterErrorCode.RouterClosed,
-          routerException.getErrorCode());
+      Assert.assertEquals(RouterErrorCode.OperationTimedOut, routerException.getErrorCode());
     }
+    router.close();
   }
 
   /**
@@ -219,23 +293,61 @@ public class GetManagerTest {
    */
   private void getBlobAndCompareContent(String blobId)
       throws Exception {
-    compareContent(router.getBlob(blobId).get());
+    GetBlobResult result = router.getBlob(blobId, options).get();
+    switch (options.getOperationType()) {
+      case All:
+        compareBlobInfo(result.getBlobInfo());
+        compareContent(result.getBlobDataChannel());
+        break;
+      case Data:
+        compareContent(result.getBlobDataChannel());
+        break;
+      case BlobInfo:
+        compareBlobInfo(result.getBlobInfo());
+        Assert.assertNull("Unexpected blob data channel in result", result.getBlobDataChannel());
+        break;
+    }
   }
 
-  private void compareContent(ReadableStreamChannel readableStreamChannel) throws Exception {
+  /**
+   * Compare and assert that the properties and user metadata in the given {@link BlobInfo} is exactly the same as
+   * the original put properties and metadata.
+   * @param blobInfo the {@link ReadableStreamChannel} that is the candidate for comparison.
+   */
+  private void compareBlobInfo(BlobInfo blobInfo) {
+    Assert.assertTrue("Blob properties should match",
+        RouterTestHelpers.haveEquivalentFields(putBlobProperties, blobInfo.getBlobProperties()));
+    Assert.assertArrayEquals("User metadata should match", putUserMetadata, blobInfo.getUserMetadata());
+  }
+
+  /**
+   * Compare and assert that the content in the given {@link ReadableStreamChannel} is exactly the same as
+   * the original put content.
+   * @param readableStreamChannel the {@link ReadableStreamChannel} that is the candidate for comparison.
+   */
+  private void compareContent(ReadableStreamChannel readableStreamChannel)
+      throws Exception {
+    ByteBuffer putContentBuf = ByteBuffer.wrap(putContent);
+    // If a range is set, compare the result against the specified byte range.
+    if (options.getRange() != null) {
+      ByteRange range = options.getRange().toResolvedByteRange(putContent.length);
+      putContentBuf = ByteBuffer.wrap(putContent, (int) range.getStartOffset(), (int) range.getRangeSize());
+    }
     ByteBufferAsyncWritableChannel getChannel = new ByteBufferAsyncWritableChannel();
     Future<Long> readIntoFuture = readableStreamChannel.readInto(getChannel, null);
+    final int bytesToRead = putContentBuf.remaining();
     int readBytes = 0;
     do {
       ByteBuffer buf = getChannel.getNextChunk();
       int bufLength = buf.remaining();
       Assert.assertTrue("total content read should not be greater than length of put content",
-          readBytes + bufLength <= putContent.length);
+          readBytes + bufLength <= bytesToRead);
       while (buf.hasRemaining()) {
-        Assert.assertEquals("Get and Put blob content should match", putContent[readBytes++], buf.get());
+        Assert.assertEquals("Get and Put blob content should match", putContentBuf.get(), buf.get());
+        readBytes++;
       }
       getChannel.resolveOldestChunk(null);
-    } while (readBytes < putContent.length);
+    } while (readBytes < bytesToRead);
     Assert.assertEquals("the returned length in the future should be the length of data written", (long) readBytes,
         (long) readIntoFuture.get());
     Assert.assertNull("There should be no more data in the channel", getChannel.getNextChunk(0));
@@ -253,7 +365,8 @@ public class GetManagerTest {
     properties.setProperty("router.put.request.parallelism", Integer.toString(requestParallelism));
     properties.setProperty("router.put.success.target", Integer.toString(successTarget));
     VerifiableProperties vProps = new VerifiableProperties(properties);
-    router = new NonBlockingRouter(new RouterConfig(vProps), new NonBlockingRouterMetrics(mockClusterMap),
+    routerConfig = new RouterConfig(vProps);
+    router = new NonBlockingRouter(routerConfig, new NonBlockingRouterMetrics(mockClusterMap),
         new MockNetworkClientFactory(vProps, mockSelectorState, MAX_PORTS_PLAIN_TEXT, MAX_PORTS_SSL,
             CHECKOUT_TIMEOUT_MS, mockServerLayout, mockTime), new LoggingNotificationSystem(), mockClusterMap,
         mockTime);
@@ -263,8 +376,9 @@ public class GetManagerTest {
   /**
    * Set operation parameters for the blob that will be put and got.
    * @param blobSize the blob size for the blob that will be put and got.
+   * @param options the options for the get request
    */
-  private void setOperationParams(int blobSize) {
+  private void setOperationParams(int blobSize, GetBlobOptions options) {
     putBlobProperties =
         new BlobProperties(blobSize, "serviceId", "memberId", "contentType", false, Utils.Infinite_Time);
     putUserMetadata = new byte[10];
@@ -272,6 +386,7 @@ public class GetManagerTest {
     putContent = new byte[blobSize];
     random.nextBytes(putContent);
     putChannel = new ByteBufferReadableStreamChannel(ByteBuffer.wrap(putContent));
+    this.options = options;
   }
 }
 

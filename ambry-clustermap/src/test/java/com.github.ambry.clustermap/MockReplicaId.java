@@ -26,6 +26,7 @@ public class MockReplicaId implements ReplicaId {
   private PartitionId partitionId;
   private MockDataNodeId dataNodeId;
   private MockDiskId diskId;
+  private boolean isMarkedDown = false;
 
   public MockReplicaId() {
   }
@@ -78,7 +79,7 @@ public class MockReplicaId implements ReplicaId {
 
   @Override
   public long getCapacityInBytes() {
-    return 10000000;
+    return 100000000;
   }
 
   @Override
@@ -86,9 +87,12 @@ public class MockReplicaId implements ReplicaId {
     return diskId;
   }
 
+  /**
+   * @return true if the replica is down; false otherwise.
+   */
   @Override
   public boolean isDown() {
-    return getDataNodeId().getState() == HardwareState.UNAVAILABLE
+    return isMarkedDown || getDataNodeId().getState() == HardwareState.UNAVAILABLE
         || getDiskId().getState() == HardwareState.UNAVAILABLE;
   }
 
@@ -103,5 +107,13 @@ public class MockReplicaId implements ReplicaId {
       replica.delete();
     }
     replicaDir.delete();
+  }
+
+  /**
+   * Mark a replica as down or up.
+   * @param isDown if true, marks the replica as down; if false, marks it as up.
+   */
+  public void markReplicaDownStatus(boolean isDown) {
+    isMarkedDown = isDown;
   }
 }
