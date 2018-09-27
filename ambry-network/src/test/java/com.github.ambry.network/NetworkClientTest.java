@@ -14,6 +14,9 @@
 package com.github.ambry.network;
 
 import com.codahale.metrics.MetricRegistry;
+import com.github.ambry.clustermap.DataNodeId;
+import com.github.ambry.clustermap.MockClusterMap;
+import com.github.ambry.clustermap.MockDataNodeId;
 import com.github.ambry.config.NetworkConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.utils.MockTime;
@@ -23,10 +26,12 @@ import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.WritableByteChannel;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Properties;
 import java.util.Set;
+import java.util.stream.Collectors;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -51,8 +56,7 @@ public class NetworkClientTest {
    * Test the {@link NetworkClientFactory}
    */
   @Test
-  public void testNetworkClientFactory()
-      throws IOException {
+  public void testNetworkClientFactory() throws IOException {
     Properties props = new Properties();
     props.setProperty("router.connection.checkout.timeout.ms", "1000");
     VerifiableProperties vprops = new VerifiableProperties(props);
@@ -64,8 +68,7 @@ public class NetworkClientTest {
     Assert.assertNotNull("NetworkClient returned should be non-null", networkClientFactory.getNetworkClient());
   }
 
-  public NetworkClientTest()
-      throws IOException {
+  public NetworkClientTest() throws IOException {
     Properties props = new Properties();
     VerifiableProperties vprops = new VerifiableProperties(props);
     NetworkConfig networkConfig = new NetworkConfig(vprops);
@@ -77,11 +80,74 @@ public class NetworkClientTest {
   }
 
   /**
+   * Test {@link NetworkClient#warmUpConnections(List, int, long)}
+   */
+  @Test
+  public void testWarmUpConnections() throws IOException {
+    MockClusterMap mockClusterMap = new MockClusterMap(true, 9, 3, 3, false);
+    List<DataNodeId> localDataNodeIds = mockClusterMap.getDataNodeIds()
+        .stream()
+        .filter(dataNodeId -> mockClusterMap.getDatacenterName(mockClusterMap.getLocalDatacenterId())
+            .equals(dataNodeId.getDatacenterName()))
+        .collect(Collectors.toList());
+    int maxPort = mockClusterMap.isSslPortsEnabled() ? MAX_PORTS_SSL : MAX_PORTS_PLAIN_TEXT;
+    // warm up plain-text connections.
+    doTestWarmUpConnections(localDataNodeIds, maxPort, PortType.PLAINTEXT);
+    // enable SSL to local DC.
+    for (DataNodeId dataNodeId : localDataNodeIds) {
+      ((MockDataNodeId) dataNodeId).setSslEnabledDataCenters(
+          Collections.singletonList(mockClusterMap.getDatacenterName(mockClusterMap.getLocalDatacenterId())));
+    }
+    // warm up SSL connections.`
+    doTestWarmUpConnections(localDataNodeIds, maxPort, PortType.SSL);
+  }
+
+  /**
+   * Test {@link NetworkClient#warmUpConnections(List, int, long)}
+   */
+  @Test
+  public void testWarmUpConnectionsSsl() throws IOException {
+    MockClusterMap mockClusterMap = new MockClusterMap();
+    List<DataNodeId> localDataNodeIds = mockClusterMap.getDataNodeIds()
+        .stream()
+        .filter(dataNodeId -> mockClusterMap.getDatacenterName(mockClusterMap.getLocalDatacenterId())
+            .equals(dataNodeId.getDatacenterName()))
+        .collect(Collectors.toList());
+    int maxPort = mockClusterMap.isSslPortsEnabled() ? MAX_PORTS_SSL : MAX_PORTS_PLAIN_TEXT;
+    Assert.assertEquals("Connection count is not expected", maxPort * localDataNodeIds.size(),
+        networkClient.warmUpConnections(localDataNodeIds, 100, 2000));
+    Assert.assertEquals("Connection count is not expected", 50 * maxPort / 100 * localDataNodeIds.size(),
+        networkClient.warmUpConnections(localDataNodeIds, 50, 2000));
+    Assert.assertEquals("Connection count is not expected", 0,
+        networkClient.warmUpConnections(localDataNodeIds, 0, 2000));
+    selector.setState(MockSelectorState.FailConnectionInitiationOnPoll);
+    Assert.assertEquals("Connection count is not expected", 0,
+        networkClient.warmUpConnections(localDataNodeIds, 100, 2000));
+    selector.setState(MockSelectorState.Good);
+  }
+
+  /**
+   * Test connection warm up failed case.
+   */
+  @Test
+  public void testWarmUpConnectionsFailedAll() throws IOException {
+    MockClusterMap mockClusterMap = new MockClusterMap();
+    List<DataNodeId> localDataNodeIds = mockClusterMap.getDataNodeIds()
+        .stream()
+        .filter(dataNodeId -> mockClusterMap.getDatacenterName(mockClusterMap.getLocalDatacenterId())
+            .equals(dataNodeId.getDatacenterName()))
+        .collect(Collectors.toList());
+    selector.setState(MockSelectorState.FailConnectionInitiationOnPoll);
+    Assert.assertEquals("Connection count is not expected", 0,
+        networkClient.warmUpConnections(localDataNodeIds, 2, 2000));
+    selector.setState(MockSelectorState.Good);
+  }
+
+  /**
    * tests basic request sending, polling and receiving responses correctly associated with the requests.
    */
   @Test
-  public void testBasicSendAndPoll()
-      throws IOException {
+  public void testBasicSendAndPoll() throws IOException {
     List<RequestInfo> requestInfoList = new ArrayList<RequestInfo>();
     List<ResponseInfo> responseInfoList;
     requestInfoList.add(new RequestInfo(host1, port1, new MockSend(1)));
@@ -115,8 +181,7 @@ public class NetworkClientTest {
    * Tests a failure scenario where requests remain too long in the {@link NetworkClient}'s pending requests queue.
    */
   @Test
-  public void testConnectionUnavailable()
-      throws IOException, InterruptedException {
+  public void testConnectionUnavailable() throws IOException, InterruptedException {
     List<RequestInfo> requestInfoList = new ArrayList<RequestInfo>();
     List<ResponseInfo> responseInfoList;
     requestInfoList.add(new RequestInfo(host2, port2, new MockSend(3)));
@@ -155,8 +220,7 @@ public class NetworkClientTest {
    * Tests a failure scenario where connections get disconnected after requests are sent out.
    */
   @Test
-  public void testNetworkError()
-      throws IOException, InterruptedException {
+  public void testNetworkError() throws IOException, InterruptedException {
     List<RequestInfo> requestInfoList = new ArrayList<RequestInfo>();
     List<ResponseInfo> responseInfoList;
     requestInfoList.add(new RequestInfo(host2, port2, new MockSend(5)));
@@ -210,8 +274,7 @@ public class NetworkClientTest {
    * immediately failed.
    */
   @Test
-  public void testConnectionInitializationFailures()
-      throws Exception {
+  public void testConnectionInitializationFailures() throws Exception {
     List<RequestInfo> requestInfoList = new ArrayList<>();
     requestInfoList.add(new RequestInfo(host2, port2, new MockSend(0)));
     selector.setState(MockSelectorState.IdlePoll);
@@ -265,8 +328,7 @@ public class NetworkClientTest {
    * @throws Exception
    */
   @Test
-  public void testOutOfOrderConnectionEstablishment()
-      throws Exception {
+  public void testOutOfOrderConnectionEstablishment() throws Exception {
     selector.setState(MockSelectorState.DelayFailAlternateConnect);
     List<RequestInfo> requestInfoList = new ArrayList<>();
     requestInfoList.add(new RequestInfo(host2, port2, new MockSend(2)));
@@ -296,8 +358,7 @@ public class NetworkClientTest {
    * @throws Exception
    */
   @Test
-  public void testPendingRequestTimeOutWithDisconnection()
-      throws Exception {
+  public void testPendingRequestTimeOutWithDisconnection() throws Exception {
     List<RequestInfo> requestInfoList = new ArrayList<>();
     selector.setState(MockSelectorState.IdlePoll);
     requestInfoList.add(new RequestInfo(host2, port2, new MockSend(4)));
@@ -347,8 +408,7 @@ public class NetworkClientTest {
    * Test to ensure subsequent operations after a close throw an {@link IllegalStateException}.
    */
   @Test
-  public void testClose()
-      throws IOException {
+  public void testClose() throws IOException {
     List<RequestInfo> requestInfoList = new ArrayList<RequestInfo>();
     networkClient.close();
     try {
@@ -356,6 +416,24 @@ public class NetworkClientTest {
       Assert.fail("Polling after close should throw");
     } catch (IllegalStateException e) {
     }
+  }
+
+  /**
+   * Helper function to test {@link NetworkClient#warmUpConnections(List, int, long)}
+   */
+  private void doTestWarmUpConnections(List<DataNodeId> localDataNodeIds, int maxPort, PortType expectedPortType) {
+    Assert.assertEquals("Port type is not expected.", expectedPortType,
+        localDataNodeIds.get(0).getPortToConnectTo().getPortType());
+    Assert.assertEquals("Connection count is not expected", maxPort * localDataNodeIds.size(),
+        networkClient.warmUpConnections(localDataNodeIds, 100, 2000));
+    Assert.assertEquals("Connection count is not expected", 50 * maxPort / 100 * localDataNodeIds.size(),
+        networkClient.warmUpConnections(localDataNodeIds, 50, 2000));
+    Assert.assertEquals("Connection count is not expected", 0,
+        networkClient.warmUpConnections(localDataNodeIds, 0, 2000));
+    selector.setState(MockSelectorState.FailConnectionInitiationOnPoll);
+    Assert.assertEquals("Connection count is not expected", 0,
+        networkClient.warmUpConnections(localDataNodeIds, 100, 2000));
+    selector.setState(MockSelectorState.Good);
   }
 }
 
@@ -389,8 +467,7 @@ class MockSend implements Send {
    * {@inheritDoc}
    */
   @Override
-  public long writeTo(WritableByteChannel channel)
-      throws IOException {
+  public long writeTo(WritableByteChannel channel) throws IOException {
     long written = channel.write(buf);
     return written;
   }
@@ -446,30 +523,24 @@ enum MockSelectorState {
   /**
    * The Good state.
    */
-  Good,
-  /**
+  Good, /**
    * A state that causes all connect calls to throw an IOException.
    */
-  ThrowExceptionOnConnect,
-  /**
+  ThrowExceptionOnConnect, /**
    * A state that causes disconnections of connections on which a send is attempted.
    */
-  DisconnectOnSend,
-  /**
+  DisconnectOnSend, /**
    * A state that causes all poll calls to throw an IOException.
    */
-  ThrowExceptionOnPoll,
-  /**
+  ThrowExceptionOnPoll, /**
    * A state that causes all connections initiated to fail during poll.
    */
-  FailConnectionInitiationOnPoll,
-  /**
+  FailConnectionInitiationOnPoll, /**
    * A state that simulates inactivity during a poll. The poll itself may do work,
    * but as long as this state is set, calls to connected(), disconnected(), completedReceives() etc.
    * will return empty lists.
    */
-  IdlePoll,
-  /**
+  IdlePoll, /**
    * Fail every other connect.
    */
   DelayFailAlternateConnect;
@@ -497,8 +568,7 @@ class MockSelector extends Selector {
    * Create a MockSelector
    * @throws IOException if {@link Selector} throws.
    */
-  MockSelector()
-      throws IOException {
+  MockSelector() throws IOException {
     super(new NetworkMetrics(new MetricRegistry()), new MockTime(), null);
     super.close();
   }
@@ -555,8 +625,7 @@ class MockSelector extends Selector {
    *
    */
   @Override
-  public void poll(long timeoutMs, List<NetworkSend> sends)
-      throws IOException {
+  public void poll(long timeoutMs, List<NetworkSend> sends) throws IOException {
     if (state == MockSelectorState.ThrowExceptionOnPoll) {
       throw new IOException("Mock exception on poll");
     }

@@ -21,19 +21,27 @@ import java.util.List;
 /**
  * Mock partition id for unit tests
  */
-public class MockPartitionId extends PartitionId {
+public class MockPartitionId implements PartitionId {
 
-  Long partition;
+  final Long partition;
   public List<ReplicaId> replicaIds;
+  private PartitionState partitionState = PartitionState.READ_WRITE;
+  private final String partitionClass;
 
   public MockPartitionId() {
-    partition = 0L;
-    replicaIds = new ArrayList<ReplicaId>(0);
+    this(0L, MockClusterMap.DEFAULT_PARTITION_CLASS);
   }
 
-  public MockPartitionId(long partition, List<MockDataNodeId> dataNodes, int mountPathIndexToUse) {
+  public MockPartitionId(long partition, String partitionClass) {
     this.partition = partition;
+    this.partitionClass = partitionClass;
+    replicaIds = new ArrayList<>(0);
+  }
 
+  public MockPartitionId(long partition, String partitionClass, List<MockDataNodeId> dataNodes,
+      int mountPathIndexToUse) {
+    this.partition = partition;
+    this.partitionClass = partitionClass;
     this.replicaIds = new ArrayList<ReplicaId>(dataNodes.size());
     for (MockDataNodeId dataNode : dataNodes) {
       MockReplicaId replicaId = new MockReplicaId(dataNode.getPort(), this, dataNode, mountPathIndexToUse);
@@ -59,7 +67,7 @@ public class MockPartitionId extends PartitionId {
 
   @Override
   public PartitionState getPartitionState() {
-    return PartitionState.READ_WRITE;
+    return partitionState;
   }
 
   @Override
@@ -91,6 +99,20 @@ public class MockPartitionId extends PartitionId {
     return true;
   }
 
+  /**
+   * If all replicaIds == !isSealed, then partition status = Read-Write, else Read-Only
+   */
+  public void resolvePartitionStatus() {
+    boolean isReadWrite = true;
+    for (ReplicaId replicaId : replicaIds) {
+      if (replicaId.isSealed()) {
+        isReadWrite = false;
+        break;
+      }
+    }
+    partitionState = isReadWrite ? PartitionState.READ_WRITE : PartitionState.READ_ONLY;
+  }
+
   @Override
   public int hashCode() {
     return (int) (partition ^ (partition >>> 32));
@@ -99,6 +121,16 @@ public class MockPartitionId extends PartitionId {
   @Override
   public String toString() {
     return partition.toString();
+  }
+
+  @Override
+  public String toPathString() {
+    return String.valueOf(partition);
+  }
+
+  @Override
+  public String getPartitionClass() {
+    return partitionClass;
   }
 
   public void cleanUp() {

@@ -17,7 +17,6 @@ import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.commons.ServerErrorCode;
 import com.github.ambry.store.FindTokenFactory;
 import com.github.ambry.utils.Utils;
-
 import java.io.DataInputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -36,11 +35,18 @@ public class ReplicaMetadataResponse extends Response {
   private int replicaMetadataResponseInfoListSizeInBytes;
 
   private static int Replica_Metadata_Response_Info_List_Size_In_Bytes = 4;
-  private static final short Replica_Metadata_Response_Version_V1 = 1;
+
+  static final short REPLICA_METADATA_RESPONSE_VERSION_V_1 = 1;
+  static final short REPLICA_METADATA_RESPONSE_VERSION_V_2 = 2;
+  static final short REPLICA_METADATA_RESPONSE_VERSION_V_3 = 3;
+  static final short REPLICA_METADATA_RESPONSE_VERSION_V_4 = 4;
+  static final short REPLICA_METADATA_RESPONSE_VERSION_V_5 = 5;
+
+  static short CURRENT_VERSION = REPLICA_METADATA_RESPONSE_VERSION_V_5;
 
   public ReplicaMetadataResponse(int correlationId, String clientId, ServerErrorCode error,
       List<ReplicaMetadataResponseInfo> replicaMetadataResponseInfoList) {
-    super(RequestOrResponseType.ReplicaMetadataResponse, Replica_Metadata_Response_Version_V1, correlationId, clientId, error);
+    super(RequestOrResponseType.ReplicaMetadataResponse, CURRENT_VERSION, correlationId, clientId, error);
     this.replicaMetadataResponseInfoList = replicaMetadataResponseInfoList;
     this.replicaMetadataResponseInfoListSizeInBytes = 0;
     for (ReplicaMetadataResponseInfo replicaMetadataResponseInfo : replicaMetadataResponseInfoList) {
@@ -49,7 +55,7 @@ public class ReplicaMetadataResponse extends Response {
   }
 
   public ReplicaMetadataResponse(int correlationId, String clientId, ServerErrorCode error) {
-    super(RequestOrResponseType.ReplicaMetadataResponse, Replica_Metadata_Response_Version_V1, correlationId, clientId, error);
+    super(RequestOrResponseType.ReplicaMetadataResponse, CURRENT_VERSION, correlationId, clientId, error);
     replicaMetadataResponseInfoList = null;
     replicaMetadataResponseInfoListSizeInBytes = 0;
   }
@@ -59,8 +65,7 @@ public class ReplicaMetadataResponse extends Response {
   }
 
   public static ReplicaMetadataResponse readFrom(DataInputStream stream, FindTokenFactory factory,
-      ClusterMap clusterMap)
-      throws IOException {
+      ClusterMap clusterMap) throws IOException {
     RequestOrResponseType type = RequestOrResponseType.values()[stream.readShort()];
     if (type != RequestOrResponseType.ReplicaMetadataResponse) {
       throw new IllegalArgumentException("The type of request response is not compatible");
@@ -74,7 +79,7 @@ public class ReplicaMetadataResponse extends Response {
         new ArrayList<ReplicaMetadataResponseInfo>(replicaMetadataResponseInfoListCount);
     for (int i = 0; i < replicaMetadataResponseInfoListCount; i++) {
       ReplicaMetadataResponseInfo replicaMetadataResponseInfo =
-          ReplicaMetadataResponseInfo.readFrom(stream, factory, clusterMap);
+          ReplicaMetadataResponseInfo.readFrom(stream, factory, clusterMap, versionId);
       replicaMetadataResponseInfoList.add(replicaMetadataResponseInfo);
     }
     if (error != ServerErrorCode.No_Error) {
@@ -86,8 +91,7 @@ public class ReplicaMetadataResponse extends Response {
   }
 
   @Override
-  public long writeTo(WritableByteChannel channel)
-      throws IOException {
+  public long writeTo(WritableByteChannel channel) throws IOException {
     if (bufferToSend == null) {
       bufferToSend = ByteBuffer.allocate((int) sizeInBytes());
       writeHeader();
@@ -128,5 +132,12 @@ public class ReplicaMetadataResponse extends Response {
     }
     sb.append("]");
     return sb.toString();
+  }
+
+  /**
+   * @return the current version in which new ReplicaMetadataResponse objects are created.
+   */
+  static short getCurrentVersion() {
+    return CURRENT_VERSION;
   }
 }

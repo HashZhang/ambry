@@ -13,20 +13,27 @@
  */
 package com.github.ambry.rest;
 
+import com.github.ambry.account.Account;
+import com.github.ambry.account.Container;
 import com.github.ambry.messageformat.BlobProperties;
+import com.github.ambry.protocol.GetOption;
 import com.github.ambry.router.ByteRange;
 import com.github.ambry.router.GetBlobOptions;
+import com.github.ambry.router.GetBlobOptionsBuilder;
 import com.github.ambry.utils.Crc32;
 import com.github.ambry.utils.Pair;
 import com.github.ambry.utils.Utils;
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -85,6 +92,27 @@ public class RestUtils {
      * {@code "Range"}
      */
     public static final String RANGE = "Range";
+    /**
+     * Header to contain the Cookies
+     */
+    public final static String COOKIE = "Cookie";
+    /**
+     * Header to be set by the clients during a Get blob call to denote, that blob should be served only if the blob
+     * has been modified after the value set for this header.
+     */
+    public static final String IF_MODIFIED_SINCE = "If-Modified-Since";
+    /**
+     * Header that is set in the response of OPTIONS request that specifies the allowed methods.
+     */
+    public static final String ACCESS_CONTROL_ALLOW_METHODS = "Access-Control-Allow-Methods";
+    /**
+     * Header that is set in the response of OPTIONS request that specifies the validity of the options returned.
+     */
+    public static final String ACCESS_CONTROL_MAX_AGE = "Access-Control-Max-Age";
+    /**
+     * {@code "allow"}
+     */
+    public final static String ALLOW = "allow";
 
     // ambry specific headers
     /**
@@ -95,6 +123,14 @@ public class RestUtils {
      * mandatory in request; string; name of service
      */
     public final static String SERVICE_ID = "x-ambry-service-id";
+    /**
+     * for put request; string; name of target account
+     */
+    public final static String TARGET_ACCOUNT_NAME = "x-ambry-target-account-name";
+    /**
+     * for put request; string; name of the target container
+     */
+    public final static String TARGET_CONTAINER_NAME = "x-ambry-target-container-name";
     /**
      * optional in request; date string; default unset ("infinite ttl")
      */
@@ -114,23 +150,124 @@ public class RestUtils {
      */
     public final static String OWNER_ID = "x-ambry-owner-id";
     /**
+     * Header that is set in the response of GetBlobInfo.
+     * 'true' or 'false'; case insensitive; true indicates content is encrypted at the storage layer. false otherwise
+     */
+    public final static String ENCRYPTED_IN_STORAGE = "x-ambry-encrypted-in-storage";
+    /**
+     * optional in request; defines an option while getting the blob and is optional support in a
+     * {@link BlobStorageService}. Valid values are available in {@link GetOption}. Defaults to {@link GetOption#None}
+     */
+    public final static String GET_OPTION = "x-ambry-get-option";
+    /**
      * not allowed  in request. Allowed in response only; string; time at which blob was created.
      */
     public final static String CREATION_TIME = "x-ambry-creation-time";
+    /**
+     * The type of signed URL requested (for e.g, POST or GET).
+     */
+    public static final String URL_TYPE = "x-ambry-url-type";
+    /**
+     * The TTL (in secs) of the signed URL.
+     */
+    public static final String URL_TTL = "x-ambry-url-ttl-secs";
+    /**
+     * The maximum size of the blob that can be uploaded using the URL.
+     */
+    public static final String MAX_UPLOAD_SIZE = "x-ambry-max-upload-size";
+    /**
+     * The blob ID requested by the URL.
+     */
+    public static final String BLOB_ID = "x-ambry-blob-id";
+    /**
+     * The signed URL header name in the response for signed url requests.
+     */
+    public static final String SIGNED_URL = "x-ambry-signed-url";
+    /**
+     * Boolean field set to "true" for getting chunk upload URLs with {@code GET /signedUrl} that will eventually be
+     * stitched together.
+     */
+    public static final String CHUNK_UPLOAD = "x-ambry-chunk-upload";
+
+    /**
+     * This header will carry a UUID that represents a "session." For example, when performing a stitched upload, each
+     * chunk upload should be a part of the same session.
+     */
+    public static final String SESSION = "x-ambry-session";
+
     /**
      * prefix for any header to be set as user metadata for the given blob
      */
     public final static String USER_META_DATA_HEADER_PREFIX = "x-ambry-um-";
 
     /**
-     * Header to contain the Cookies
+     * Response header indicating the reason a request is non compliant.
      */
-    public final static String COOKIE = "Cookie";
+    public final static String NON_COMPLIANCE_WARNING = "x-ambry-non-compliance-warning";
+  }
+
+  public static final class TrackingHeaders {
+
     /**
-     * Header to be set by the clients during a Get blob call to denote, that blob should be served only if the blob
-     * has been modified after the value set for this header.
+     * Response header for the the name of the datacenter that the frontend responding belongs to.
      */
-    public static final String IF_MODIFIED_SINCE = "If-Modified-Since";
+    public static final String DATACENTER_NAME = "x-ambry-datacenter";
+    /**
+     * Response header for the hostname of the responding frontend.
+     */
+    public static final String FRONTEND_NAME = "x-ambry-frontend";
+    /**
+     * A list of all tracking headers.
+     */
+    public static final List<String> TRACKING_HEADERS;
+
+    static {
+      Field[] fields = RestUtils.TrackingHeaders.class.getDeclaredFields();
+      TRACKING_HEADERS = new ArrayList<>(fields.length);
+      try {
+        for (Field field : fields) {
+          if (field.getType() == String.class) {
+            TRACKING_HEADERS.add(field.get(null).toString());
+          }
+        }
+      } catch (IllegalAccessException e) {
+        throw new IllegalStateException("Could not get values of the tracking headers", e);
+      }
+    }
+  }
+
+  /**
+   * Ambry specific keys used internally in a {@link RestRequest}.
+   */
+  public static final class InternalKeys {
+    private static final String KEY_PREFIX = "ambry-internal-key-";
+
+    /**
+     * The key for the target {@link com.github.ambry.account.Account} indicated by the request.
+     */
+    public static final String TARGET_ACCOUNT_KEY = KEY_PREFIX + "target-account";
+
+    /**
+     * The key for the target {@link com.github.ambry.account.Container} indicated by the request.
+     */
+    public static final String TARGET_CONTAINER_KEY = KEY_PREFIX + "target-container";
+
+    /**
+     * The key for the metadata {@code Map<String, String>} to include in a signed ID. This argument should be non-null
+     * to indicate that a signed ID should be created and returned to the requester on a POST request.
+     */
+    public static final String SIGNED_ID_METADATA_KEY = KEY_PREFIX + "signed-id-metadata";
+
+    /**
+     * To be set if the operation knows the keep-alive behavior it prefers on error. Valid values are boolean.
+     * Not authoritative, only a hint
+     */
+    public final static String KEEP_ALIVE_ON_ERROR_HINT = KEY_PREFIX + "keep-alive-on-error-hint";
+
+    /**
+     * To be set to {@code true} if tracking info should be attached to frontend responses.
+     */
+    public final static String SEND_TRACKING_INFO = KEY_PREFIX + "ambry-internal-keys-send-tracking-info";
   }
 
   /**
@@ -166,65 +303,44 @@ public class RestUtils {
   private static final int CRC_SIZE = 8;
   private static final short USER_METADATA_VERSION_V1 = 1;
   private static final String BYTE_RANGE_PREFIX = BYTE_RANGE_UNITS + "=";
-  private static Logger logger = LoggerFactory.getLogger(RestUtils.class);
+  private static final Logger logger = LoggerFactory.getLogger(RestUtils.class);
 
   /**
    * Builds {@link BlobProperties} given the arguments associated with a request.
-   * @param args the arguments associated with the request.
+   * @param args the arguments associated with the request. Cannot be {@code null}.
    * @return the {@link BlobProperties} extracted from the arguments.
    * @throws RestServiceException if required arguments aren't present or if they aren't in the format or number
    *                                    expected.
    */
-  public static BlobProperties buildBlobProperties(Map<String, Object> args)
-      throws RestServiceException {
-    String blobSizeStr = getHeader(args, Headers.BLOB_SIZE, true);
-    long blobSize;
-    try {
-      blobSize = Long.parseLong(blobSizeStr);
-      if (blobSize < 0) {
-        throw new RestServiceException(Headers.BLOB_SIZE + "[" + blobSize + "] is less than 0",
-            RestServiceErrorCode.InvalidArgs);
-      }
-    } catch (NumberFormatException e) {
-      throw new RestServiceException(Headers.BLOB_SIZE + "[" + blobSizeStr + "] could not parsed into a number",
-          RestServiceErrorCode.InvalidArgs);
-    }
-
-    long ttl = Utils.Infinite_Time;
-    String ttlStr = getHeader(args, Headers.TTL, false);
-    if (ttlStr != null) {
-      try {
-        ttl = Long.parseLong(ttlStr);
-        if (ttl < -1) {
-          throw new RestServiceException(Headers.TTL + "[" + ttl + "] is not valid (has to be >= -1)",
-              RestServiceErrorCode.InvalidArgs);
-        }
-      } catch (NumberFormatException e) {
-        throw new RestServiceException(Headers.TTL + "[" + ttlStr + "] could not parsed into a number",
-            RestServiceErrorCode.InvalidArgs);
-      }
-    }
-
-    boolean isPrivate;
-    String isPrivateStr = getHeader(args, Headers.PRIVATE, false);
-    if (isPrivateStr == null || isPrivateStr.toLowerCase().equals("false")) {
-      isPrivate = false;
-    } else if (isPrivateStr.toLowerCase().equals("true")) {
-      isPrivate = true;
-    } else {
-      throw new RestServiceException(
-          Headers.PRIVATE + "[" + isPrivateStr + "] has an invalid value (allowed values:true, false)",
-          RestServiceErrorCode.InvalidArgs);
-    }
-
+  public static BlobProperties buildBlobProperties(Map<String, Object> args) throws RestServiceException {
+    Account account = getAccountFromArgs(args);
+    Container container = getContainerFromArgs(args);
     String serviceId = getHeader(args, Headers.SERVICE_ID, true);
     String contentType = getHeader(args, Headers.AMBRY_CONTENT_TYPE, true);
     String ownerId = getHeader(args, Headers.OWNER_ID, false);
 
-    return new BlobProperties(blobSize, serviceId, ownerId, contentType, isPrivate, ttl);
+    long ttl = Utils.Infinite_Time;
+    Long ttlFromHeader = getLongHeader(args, Headers.TTL, false);
+    if (ttlFromHeader != null) {
+      if (ttlFromHeader < -1) {
+        throw new RestServiceException(Headers.TTL + "[" + ttlFromHeader + "] is not valid (has to be >= -1)",
+            RestServiceErrorCode.InvalidArgs);
+      }
+      ttl = ttlFromHeader;
+    }
+
+    // This field should not matter on newly created blobs, because all privacy/cacheability decisions should be made
+    // based on the container properties and ACLs. For now, BlobProperties still includes this field, though.
+    boolean isPrivate = !container.isCacheable();
+    return new BlobProperties(-1, serviceId, ownerId, contentType, isPrivate, ttl, account.getId(), container.getId(),
+        container.isEncrypted());
   }
 
   /**
+   * Builds user metadata given the arguments associated with a request.
+   * <p>
+   * The following binary format will be used:
+   * <pre>
    *  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
    * |         |   size    |  total   |           |          |             |            |            |            |            |
    * | version | excluding |  no of   | key1 size |   key1   | value1 size |  value 1   |  key2 size |     ...    |     Crc    |
@@ -250,17 +366,13 @@ public class RestUtils {
    *  key2 size      - Size of 2nd key
    *
    *  crc        - The crc of the user metadata record
+   * </pre>
    *
-   */
-
-  /**
-   * Builds user metadata given the arguments associated with a request.
    * @param args the arguments associated with the request.
    * @return the user metadata extracted from arguments.
    * @throws RestServiceException if usermetadata arguments have null values.
    */
-  public static byte[] buildUsermetadata(Map<String, Object> args)
-      throws RestServiceException {
+  public static byte[] buildUserMetadata(Map<String, Object> args) throws RestServiceException {
     ByteBuffer userMetadata;
     if (args.containsKey(MultipartPost.USER_METADATA_PART)) {
       userMetadata = (ByteBuffer) args.get(MultipartPost.USER_METADATA_PART);
@@ -269,7 +381,7 @@ public class RestUtils {
       int sizeToAllocate = 0;
       for (Map.Entry<String, Object> entry : args.entrySet()) {
         String key = entry.getKey();
-        if (key.startsWith(Headers.USER_META_DATA_HEADER_PREFIX)) {
+        if (key.toLowerCase().startsWith(Headers.USER_META_DATA_HEADER_PREFIX)) {
           // key size
           sizeToAllocate += 4;
           String keyToStore = key.substring(Headers.USER_META_DATA_HEADER_PREFIX.length());
@@ -316,8 +428,7 @@ public class RestUtils {
    * @return the user metadata that is read from the byte array, or {@code null} if the {@code userMetadata} cannot be
    * parsed in expected format
    */
-  public static Map<String, String> buildUserMetadata(byte[] userMetadata)
-      throws RestServiceException {
+  public static Map<String, String> buildUserMetadata(byte[] userMetadata) throws RestServiceException {
     Map<String, String> toReturn = null;
     if (userMetadata.length > 0) {
       try {
@@ -366,18 +477,21 @@ public class RestUtils {
    * @param args the arguments associated with the request. This is typically a map of header names and query string
    *             arguments to values.
    * @param subResource the {@link SubResource} for the request, or {@code null} if no sub-resource is requested.
+   * @param getOption the {@link GetOption} required.
    * @return a populated {@link GetBlobOptions} object.
    * @throws RestServiceException if the {@link GetBlobOptions} could not be constructed.
    */
-  public static GetBlobOptions buildGetBlobOptions(Map<String, Object> args, SubResource subResource)
-      throws RestServiceException {
+  public static GetBlobOptions buildGetBlobOptions(Map<String, Object> args, SubResource subResource,
+      GetOption getOption) throws RestServiceException {
     String rangeHeaderValue = getHeader(args, Headers.RANGE, false);
     if (subResource != null && rangeHeaderValue != null) {
       throw new RestServiceException("Ranges not supported for sub-resources.", RestServiceErrorCode.InvalidArgs);
     }
-    return new GetBlobOptions(
-        subResource == null ? GetBlobOptions.OperationType.All : GetBlobOptions.OperationType.BlobInfo,
-        rangeHeaderValue != null ? RestUtils.buildByteRange(rangeHeaderValue) : null);
+    return new GetBlobOptionsBuilder().operationType(
+        subResource == null ? GetBlobOptions.OperationType.All : GetBlobOptions.OperationType.BlobInfo)
+        .getOption(getOption)
+        .range(rangeHeaderValue != null ? RestUtils.buildByteRange(rangeHeaderValue) : null)
+        .build();
   }
 
   /**
@@ -436,7 +550,12 @@ public class RestUtils {
       // "- 1" removes the "slash" that precedes the sub-resource.
       endIndex = endIndex - subResource.name().length() - 1;
     }
-    return path.substring(startIndex, endIndex);
+    String operationOrBlobId = path.substring(startIndex, endIndex);
+    if ((operationOrBlobId.isEmpty() || operationOrBlobId.equals("/")) && restRequest.getArgs()
+        .containsKey(Headers.BLOB_ID)) {
+      operationOrBlobId = restRequest.getArgs().get(Headers.BLOB_ID).toString();
+    }
+    return operationOrBlobId;
   }
 
   /**
@@ -488,6 +607,70 @@ public class RestUtils {
   }
 
   /**
+   * Gets the {@link GetOption} required by the request.
+   * @param restRequest the representation of the request.
+   * @param defaultGetOption the {@link GetOption} to use if the {@code restRequest} doesn't have one. Can be
+   * {@code null}.
+   * @return the required {@link GetOption}. Defaults to {@link GetOption#None}.
+   * @throws RestServiceException if the {@link RestUtils.Headers#GET_OPTION} is present but not recognized.
+   */
+  public static GetOption getGetOption(RestRequest restRequest, GetOption defaultGetOption)
+      throws RestServiceException {
+    GetOption option = defaultGetOption == null ? GetOption.None : defaultGetOption;
+    Object value = restRequest.getArgs().get(RestUtils.Headers.GET_OPTION);
+    if (value != null) {
+      String str = (String) value;
+      boolean foundMatch = false;
+      for (GetOption getOption : GetOption.values()) {
+        if (str.equalsIgnoreCase(getOption.name())) {
+          option = getOption;
+          foundMatch = true;
+          break;
+        }
+      }
+      if (!foundMatch) {
+        throw new RestServiceException("Unrecognized value for [" + RestUtils.Headers.GET_OPTION + "]: " + str,
+            RestServiceErrorCode.InvalidArgs);
+      }
+    }
+    return option;
+  }
+
+  /**
+   * Gets the isPrivate setting from the args.
+   * @param args The args where to include the isPrivate setting.
+   * @return A boolean to indicate the value of the isPrivate flag.
+   * @throws RestServiceException if exception occurs during parsing the arg.
+   */
+  public static boolean isPrivate(Map<String, Object> args) throws RestServiceException {
+    return getBooleanHeader(args, Headers.PRIVATE, false);
+  }
+
+  /**
+   * Determine if {@link Headers#CHUNK_UPLOAD} is set in the request args.
+   * @param args The request arguments.
+   * @return {@code true} if {@link Headers#CHUNK_UPLOAD} is set.
+   * @throws RestServiceException if exception occurs during parsing the arg.
+   */
+  public static boolean isChunkUpload(Map<String, Object> args) throws RestServiceException {
+    return getHeader(args, Headers.CHUNK_UPLOAD, false) != null;
+  }
+
+  /**
+   * Ensures the required headers are present.
+   * @param restRequest The {@link RestRequest} to ensure header presence. Cannot be {@code null}.
+   * @param requiredHeaders A set of headers to check presence. Cannot be {@code null}.
+   * @throws RestServiceException if any of the headers is missing.
+   */
+  public static void ensureRequiredHeadersOrThrow(RestRequest restRequest, Set<String> requiredHeaders)
+      throws RestServiceException {
+    Map<String, Object> args = restRequest.getArgs();
+    for (String header : requiredHeaders) {
+      getHeader(args, header, true);
+    }
+  }
+
+  /**
    * Gets the value of the header {@code header} in {@code args}.
    * @param args a map of arguments to be used to look for {@code header}.
    * @param header the name of the header.
@@ -499,7 +682,7 @@ public class RestUtils {
    *                                    {@code args} or if there is more than one value for {@code header} in
    *                                    {@code args}.
    */
-  private static String getHeader(Map<String, Object> args, String header, boolean required)
+  public static String getHeader(Map<String, Object> args, String header, boolean required)
       throws RestServiceException {
     String value = null;
     if (args.containsKey(header)) {
@@ -517,6 +700,130 @@ public class RestUtils {
   }
 
   /**
+   * Gets the value of a header as a {@link Long}
+   * @param args a map of arguments to be used to look for {@code header}.
+   * @param header the name of the header.
+   * @param required if {@code true}, {@link RestServiceException} will be thrown if {@code header} is not present
+   *                 in {@code args}.
+   * @return the value of {@code header} in {@code args} if it exists. If it does not exist and {@code required} is
+   *          {@code false}, then returns null.
+   * @throws RestServiceException same as cases of {@link #getHeader(Map, String, boolean)} and if the value cannot be
+   *                              converted to a {@link Long}.
+   */
+  public static Long getLongHeader(Map<String, Object> args, String header, boolean required)
+      throws RestServiceException {
+    // if getHeader() is no longer called, tests for this function have to be changed.
+    String value = getHeader(args, header, required);
+    if (value != null) {
+      try {
+        return Long.parseLong(value);
+      } catch (NumberFormatException e) {
+        throw new RestServiceException("Invalid value for " + header + ": " + value, e,
+            RestServiceErrorCode.InvalidArgs);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Gets the value of a header as a {@code boolean}.
+   * @param args a map of arguments to be used to look for {@code header}.
+   * @param header the name of the header.
+   * @param required if {@code true}, {@link RestServiceException} will be thrown if {@code header} is not present
+   *                 in {@code args}.
+   * @return {@code true} if the header's value is {@code "true"} (case-insensitive), or {@code false} if the header's
+   *         value is {@code "false} (case-insensitive) or the header is not present and {@code required} is
+   *         {@code false}.
+   * @throws RestServiceException same as cases of {@link #getHeader(Map, String, boolean)} and if the value cannot be
+   *                              converted to a {@code boolean}.
+   */
+  public static boolean getBooleanHeader(Map<String, Object> args, String header, boolean required)
+      throws RestServiceException {
+    boolean booleanValue;
+    String stringValue = getHeader(args, header, required);
+    if (stringValue == null || "false".equalsIgnoreCase(stringValue)) {
+      booleanValue = false;
+    } else if ("true".equalsIgnoreCase(stringValue)) {
+      booleanValue = true;
+    } else {
+      throw new RestServiceException(
+          header + "[" + stringValue + "] has an invalid value (allowed values: true, false)",
+          RestServiceErrorCode.InvalidArgs);
+    }
+    return booleanValue;
+  }
+
+  /**
+   * Extract the injected {@link Account} from a map of arguments.
+   * @param args a map of arguments that possibly contains the injected {@link Account} and {@link Container}.
+   * @return the {@link Account}
+   * @throws RestServiceException
+   */
+  public static Account getAccountFromArgs(Map<String, Object> args) throws RestServiceException {
+    Object account = args.get(InternalKeys.TARGET_ACCOUNT_KEY);
+    if (account == null) {
+      throw new RestServiceException(InternalKeys.TARGET_ACCOUNT_KEY + " is not set",
+          RestServiceErrorCode.InternalServerError);
+    }
+    if (!(account instanceof Account)) {
+      throw new RestServiceException(InternalKeys.TARGET_ACCOUNT_KEY + " not instance of Account",
+          RestServiceErrorCode.InternalServerError);
+    }
+    return (Account) account;
+  }
+
+  /**
+   * Extract the injected {@link Container} from a map of arguments.
+   * @param args a map of arguments that possibly contains the injected {@link Account} and {@link Container}.
+   * @return a {@link Container}
+   * @throws RestServiceException
+   */
+  public static Container getContainerFromArgs(Map<String, Object> args) throws RestServiceException {
+    Object container = args.get(InternalKeys.TARGET_CONTAINER_KEY);
+    if (container == null) {
+      throw new RestServiceException(InternalKeys.TARGET_CONTAINER_KEY + " is not set",
+          RestServiceErrorCode.InternalServerError);
+    }
+    if (!(container instanceof Container)) {
+      throw new RestServiceException(InternalKeys.TARGET_CONTAINER_KEY + " not instance of Container",
+          RestServiceErrorCode.InternalServerError);
+    }
+    return (Container) container;
+  }
+
+  /**
+   * Check preconditions for request if the {@code restRequest} contains the target account and container.
+   * @param restRequest the {@link RestRequest} that contains the {@link Account} and {@link Container} details.
+   * @throws RestServiceException if preconditions check failed.
+   */
+  public static void accountAndContainerNamePreconditionCheck(RestRequest restRequest) throws RestServiceException {
+    String accountNameFromHeader = getHeader(restRequest.getArgs(), Headers.TARGET_ACCOUNT_NAME, false);
+    String containerNameFromHeader = getHeader(restRequest.getArgs(), Headers.TARGET_CONTAINER_NAME, false);
+    if (accountNameFromHeader != null) {
+      Account targetAccount = getAccountFromArgs(restRequest.getArgs());
+      String accountNameFromBlobId = targetAccount.getName();
+      if (!accountNameFromHeader.equals(accountNameFromBlobId)) {
+        throw new RestServiceException(
+            "Account name: " + accountNameFromHeader + " from request doesn't match the account name from Blob id : "
+                + accountNameFromBlobId, RestServiceErrorCode.PreconditionFailed);
+      }
+      if (containerNameFromHeader != null) {
+        Container targetContainer = getContainerFromArgs(restRequest.getArgs());
+        String containerNameFromBlobId = targetContainer.getName();
+        if (!containerNameFromHeader.equals(containerNameFromBlobId)) {
+          throw new RestServiceException("Container name: " + containerNameFromHeader
+              + "from request doesn't match the container name from Blob id : " + containerNameFromBlobId,
+              RestServiceErrorCode.PreconditionFailed);
+        }
+      }
+    } else if (containerNameFromHeader != null) {
+      throw new RestServiceException(
+          "Only container name is set in request with no corresponding account name is not allowed.",
+          RestServiceErrorCode.BadRequest);
+    }
+  }
+
+  /**
    * Build a {@link ByteRange} given a Range header value. This method can parse the following Range
    * header syntax:
    * {@code Range:bytes=byte_range} where {@code bytes=byte_range} supports the following range syntax:
@@ -530,8 +837,7 @@ public class RestUtils {
    * @throws RestServiceException if no range header was found, or if a valid range could not be parsed from the header
    *                              value,
    */
-  private static ByteRange buildByteRange(String rangeHeaderValue)
-      throws RestServiceException {
+  private static ByteRange buildByteRange(String rangeHeaderValue) throws RestServiceException {
     if (!rangeHeaderValue.startsWith(BYTE_RANGE_PREFIX)) {
       throw new RestServiceException("Invalid byte range syntax; does not start with '" + BYTE_RANGE_PREFIX + "'",
           RestServiceErrorCode.InvalidArgs);

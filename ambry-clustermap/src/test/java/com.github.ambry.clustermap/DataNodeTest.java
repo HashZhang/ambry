@@ -16,23 +16,21 @@ package com.github.ambry.clustermap;
 import com.github.ambry.config.ClusterMapConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.network.PortType;
+import java.util.Objects;
 import java.util.Properties;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 import org.junit.Test;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import static org.junit.Assert.*;
 
 
 // TestDataNode permits DataNode to be constructed with a null Datacenter.
 class TestDataNode extends DataNode {
   public TestDataNode(String dataCenterName, JSONObject jsonObject, ClusterMapConfig clusterMapConfig)
       throws JSONException {
-    super(new TestDatacenter(TestUtils.getJsonDatacenter(dataCenterName, new JSONArray()), clusterMapConfig),
+    super(new TestDatacenter(TestUtils.getJsonDatacenter(dataCenterName, (byte) 0, new JSONArray()), clusterMapConfig),
         jsonObject, clusterMapConfig);
   }
 
@@ -61,10 +59,10 @@ class TestDataNode extends DataNode {
     if (getState() != testDataNode.getState()) {
       return false;
     }
-    if (getRackId() != testDataNode.getRackId()) {
+    if (getRawCapacityInBytes() != testDataNode.getRawCapacityInBytes()) {
       return false;
     }
-    return getRawCapacityInBytes() == testDataNode.getRawCapacityInBytes();
+    return Objects.equals(getRackId(), testDataNode.getRackId());
   }
 }
 
@@ -74,19 +72,25 @@ class TestDataNode extends DataNode {
 public class DataNodeTest {
   private static final int diskCount = 10;
   private static final long diskCapacityInBytes = 1000 * 1024 * 1024 * 1024L;
+  private Properties props;
 
-  JSONArray getDisks()
-      throws JSONException {
+  public DataNodeTest() {
+    props = new Properties();
+    props.setProperty("clustermap.cluster.name", "test");
+    props.setProperty("clustermap.datacenter.name", "dc1");
+    props.setProperty("clustermap.host.name", "localhost");
+  }
+
+  JSONArray getDisks() throws JSONException {
     return TestUtils.getJsonArrayDisks(diskCount, "/mnt", HardwareState.AVAILABLE, diskCapacityInBytes);
   }
 
   @Test
-  public void basics()
-      throws JSONException {
+  public void basics() throws JSONException {
 
     JSONObject jsonObject =
         TestUtils.getJsonDataNode(TestUtils.getLocalHost(), 6666, 7666, HardwareState.AVAILABLE, getDisks());
-    ClusterMapConfig clusterMapConfig = new ClusterMapConfig(new VerifiableProperties(new Properties()));
+    ClusterMapConfig clusterMapConfig = new ClusterMapConfig(new VerifiableProperties(props));
 
     DataNode dataNode = new TestDataNode("datacenter", jsonObject, clusterMapConfig);
 
@@ -97,23 +101,24 @@ public class DataNodeTest {
     assertEquals(dataNode.getDisks().size(), diskCount);
     assertEquals(dataNode.getRawCapacityInBytes(), diskCount * diskCapacityInBytes);
 
-    assertEquals(-1, dataNode.getRackId());
+    assertNull(dataNode.getRackId());
+    assertEquals(TestUtils.DEFAULT_XID, dataNode.getXid());
 
     assertEquals(dataNode.toJSONObject().toString(), jsonObject.toString());
     assertEquals(dataNode, new TestDataNode("datacenter", dataNode.toJSONObject(), clusterMapConfig));
 
     // Test with defined rackId
     jsonObject =
-        TestUtils.getJsonDataNode(TestUtils.getLocalHost(), 6666, 7666, 42, HardwareState.AVAILABLE, getDisks());
+        TestUtils.getJsonDataNode(TestUtils.getLocalHost(), 6666, 7666, 42, TestUtils.DEFAULT_XID, HardwareState.AVAILABLE, getDisks());
     dataNode = new TestDataNode("datacenter", jsonObject, clusterMapConfig);
-    assertEquals(42, dataNode.getRackId());
+    assertEquals("42", dataNode.getRackId());
+    assertEquals(TestUtils.DEFAULT_XID, dataNode.getXid());
 
     assertEquals(dataNode.toJSONObject().toString(), jsonObject.toString());
     assertEquals(dataNode, new TestDataNode("datacenter", dataNode.toJSONObject(), clusterMapConfig));
   }
 
-  public void failValidation(JSONObject jsonObject, ClusterMapConfig clusterMapConfig)
-      throws JSONException {
+  private void failValidation(JSONObject jsonObject, ClusterMapConfig clusterMapConfig) throws JSONException {
     try {
       new TestDataNode("datacenter", jsonObject, clusterMapConfig);
       fail("Construction of TestDataNode should have failed validation.");
@@ -123,10 +128,9 @@ public class DataNodeTest {
   }
 
   @Test
-  public void validation()
-      throws JSONException {
+  public void validation() throws JSONException {
     JSONObject jsonObject;
-    ClusterMapConfig clusterMapConfig = new ClusterMapConfig(new VerifiableProperties(new Properties()));
+    ClusterMapConfig clusterMapConfig = new ClusterMapConfig(new VerifiableProperties(props));
 
     try {
       // Null DataNode
@@ -166,20 +170,17 @@ public class DataNodeTest {
     // same port number for plain text and ssl port
     jsonObject = TestUtils.getJsonDataNode(TestUtils.getLocalHost(), 6666, 6666, HardwareState.AVAILABLE, getDisks());
     failValidation(jsonObject, clusterMapConfig);
-
-    // bad rack ID
-    jsonObject =
-        TestUtils.getJsonDataNode(TestUtils.getLocalHost(), 6666, 7666, -2, HardwareState.AVAILABLE, getDisks());
-    failValidation(jsonObject, clusterMapConfig);
   }
 
   @Test
-  public void testSoftState()
-      throws JSONException, InterruptedException {
+  public void testSoftState() throws JSONException, InterruptedException {
     JSONObject jsonObject =
         TestUtils.getJsonDataNode(TestUtils.getLocalHost(), 6666, 7666, HardwareState.AVAILABLE, getDisks());
     Properties props = new Properties();
     props.setProperty("clustermap.fixedtimeout.datanode.retry.backoff.ms", Integer.toString(2000));
+    props.setProperty("clustermap.cluster.name", "test");
+    props.setProperty("clustermap.datacenter.name", "dc1");
+    props.setProperty("clustermap.host.name", "localhost");
     ClusterMapConfig clusterMapConfig = new ClusterMapConfig(new VerifiableProperties(props));
     int threshold = clusterMapConfig.clusterMapFixedTimeoutDatanodeErrorThreshold;
     long retryBackoffMs = clusterMapConfig.clusterMapFixedTimeoutDataNodeRetryBackoffMs;
@@ -211,11 +212,13 @@ public class DataNodeTest {
    * @throws Exception
    */
   @Test
-  public void validateGetPort()
-      throws Exception {
+  public void validateGetPort() throws Exception {
     ClusterMapConfig clusterMapConfig;
     Properties props = new Properties();
     props.setProperty("clustermap.ssl.enabled.datacenters", "datacenter1,datacenter2,datacenter3");
+    props.setProperty("clustermap.cluster.name", "test");
+    props.setProperty("clustermap.datacenter.name", "dc1");
+    props.setProperty("clustermap.host.name", "localhost");
     clusterMapConfig = new ClusterMapConfig(new VerifiableProperties(props));
     System.out.println(clusterMapConfig.clusterMapSslEnabledDatacenters);
     JSONObject jsonObject =

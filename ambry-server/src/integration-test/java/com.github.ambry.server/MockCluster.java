@@ -13,28 +13,38 @@
  */
 package com.github.ambry.server;
 
+import com.github.ambry.account.Account;
+import com.github.ambry.account.Container;
+import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.clustermap.DataNodeId;
+import com.github.ambry.clustermap.MockClusterAgentsFactory;
 import com.github.ambry.clustermap.MockClusterMap;
 import com.github.ambry.clustermap.MockDataNodeId;
+import com.github.ambry.clustermap.PartitionId;
+import com.github.ambry.commons.BlobId;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.messageformat.BlobProperties;
 import com.github.ambry.notification.BlobReplicaSourceType;
+import com.github.ambry.notification.NotificationBlobType;
 import com.github.ambry.notification.NotificationSystem;
+import com.github.ambry.notification.UpdateType;
+import com.github.ambry.store.MessageInfo;
+import com.github.ambry.utils.TestUtils;
 import com.github.ambry.utils.Time;
 import com.github.ambry.utils.Utils;
 import java.io.IOException;
-import java.net.URISyntaxException;
-import java.security.GeneralSecurityException;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import junit.framework.Assert;
 
-import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.*;
 
 
 /**
@@ -44,37 +54,46 @@ import static org.junit.Assert.assertTrue;
  * On shutdown we ensure the servers are shutdown.
  */
 public class MockCluster {
+  private final MockClusterAgentsFactory mockClusterAgentsFactory;
   private final MockClusterMap clusterMap;
   private List<AmbryServer> serverList = null;
-  private NotificationSystem notificationSystem;
   private boolean serverInitialized = false;
+  private int generalDataNodeIndex;
+  private int prefetchDataNodeIndex;
+  private final List<String> sslEnabledDataCenterList;
+  private final Properties sslProps;
+  private final boolean enableHardDeletes;
+  private final Time time;
 
-  public MockCluster(NotificationSystem notificationSystem, boolean enableHardDeletes, Time time)
-      throws IOException, InstantiationException, URISyntaxException, GeneralSecurityException {
-    this(notificationSystem, false, "", new Properties(), enableHardDeletes, time);
+  public MockCluster(boolean enableHardDeletes, Time time) throws IOException {
+    this(new Properties(), enableHardDeletes, time);
   }
 
-  public MockCluster(NotificationSystem notificationSystem, boolean enableSSL, String datacenters, Properties sslProps,
-      boolean enableHardDeletes, Time time)
-      throws IOException, InstantiationException, URISyntaxException, GeneralSecurityException {
+  public MockCluster(Properties sslProps, boolean enableHardDeletes, Time time) throws IOException {
+    this.sslProps = sslProps;
+    this.enableHardDeletes = enableHardDeletes;
+    this.time = time;
     // sslEnabledDatacenters represents comma separated list of datacenters to which ssl should be enabled
-    this.notificationSystem = notificationSystem;
-    clusterMap = new MockClusterMap(enableSSL, 9, 3, 3);
+    String sslEnabledDataCentersStr = sslProps.getProperty("clustermap.ssl.enabled.datacenters");
+    sslEnabledDataCenterList =
+        sslEnabledDataCentersStr != null ? Utils.splitString(sslEnabledDataCentersStr, ",") : new ArrayList<String>();
+
+    mockClusterAgentsFactory = new MockClusterAgentsFactory(sslEnabledDataCentersStr != null, 9, 3, 3);
+    clusterMap = mockClusterAgentsFactory.getClusterMap();
+
     serverList = new ArrayList<AmbryServer>();
-    ArrayList<String> datacenterList = Utils.splitString(datacenters, ",");
+    generalDataNodeIndex = 0;
+    prefetchDataNodeIndex = clusterMap.getDataNodes().size() - 1;
+  }
+
+  public void initializeServers(NotificationSystem notificationSystem) {
     List<MockDataNodeId> dataNodes = clusterMap.getDataNodes();
-    try {
-      for (MockDataNodeId dataNodeId : dataNodes) {
-        if (enableSSL) {
-          String sslEnabledDatacenters = getSSLEnabledDatacenterValue(dataNodeId.getDatacenterName(), datacenterList);
-          sslProps.setProperty("ssl.enabled.datacenters", sslEnabledDatacenters);
-        }
-        initializeServer(dataNodeId, sslProps, enableHardDeletes, time);
+    for (int i = 0; i < dataNodes.size(); i++) {
+      if (sslEnabledDataCenterList != null) {
+        dataNodes.get(i).setSslEnabledDataCenters(sslEnabledDataCenterList);
       }
-    } catch (InstantiationException e) {
-      // clean up other servers which was started already
-      cleanup();
-      throw e;
+      initializeServer(dataNodes.get(i), sslProps, enableHardDeletes, prefetchDataNodeIndex == i, notificationSystem,
+          time);
     }
   }
 
@@ -82,12 +101,26 @@ public class MockCluster {
     return serverList;
   }
 
+  /**
+   * Get a {@link MockDataNodeId} whose data prefetch is disabled.
+   */
+  public MockDataNodeId getGeneralDataNode() {
+    return clusterMap.getDataNodes().get(generalDataNodeIndex);
+  }
+
+  /**
+   * Get a {@link MockDataNodeId} whose data prefetch is enabled.
+   */
+  public MockDataNodeId getPrefetchDataNode() {
+    return clusterMap.getDataNodes().get(prefetchDataNodeIndex);
+  }
+
   public MockClusterMap getClusterMap() {
     return clusterMap;
   }
 
-  private void initializeServer(DataNodeId dataNodeId, Properties sslProperties, boolean enableHardDeletes, Time time)
-      throws IOException, InstantiationException, URISyntaxException {
+  private void initializeServer(DataNodeId dataNodeId, Properties sslProperties, boolean enableHardDeletes,
+      boolean enableDataPrefetch, NotificationSystem notificationSystem, Time time) {
     Properties props = new Properties();
     props.setProperty("host.name", dataNodeId.getHostname());
     props.setProperty("port", Integer.toString(dataNodeId.getPort()));
@@ -95,48 +128,47 @@ public class MockCluster {
     props.setProperty("store.enable.hard.delete", Boolean.toString(enableHardDeletes));
     props.setProperty("store.deleted.message.retention.days", "1");
     props.setProperty("replication.token.flush.interval.seconds", "5");
-    props.setProperty("replication.wait.time.between.replicas.ms", "50");
     props.setProperty("replication.validate.message.stream", "true");
+    props.setProperty("clustermap.cluster.name", "test");
+    props.setProperty("clustermap.datacenter.name", "DC1");
+    props.setProperty("clustermap.host.name", "localhost");
+    props.setProperty("store.validate.authorization", "true");
+    props.setProperty("kms.default.container.key", TestUtils.getRandomKey(32));
+    props.setProperty("server.enable.store.data.prefetch", Boolean.toString(enableDataPrefetch));
     props.putAll(sslProperties);
     VerifiableProperties propverify = new VerifiableProperties(props);
-    AmbryServer server = new AmbryServer(propverify, clusterMap, notificationSystem, time);
+    AmbryServer server = new AmbryServer(propverify, mockClusterAgentsFactory, notificationSystem, time);
     serverList.add(server);
   }
 
-  public void startServers()
-      throws InstantiationException {
+  public void startServers() throws InstantiationException, IOException {
     serverInitialized = true;
-    for (AmbryServer server : serverList) {
-      server.startup();
+    try {
+      for (AmbryServer server : serverList) {
+        server.startup();
+      }
+    } catch (Exception e) {
+      // clean up other servers which was started already
+      cleanup();
+      throw e;
     }
   }
 
-  public void cleanup()
-      throws IOException {
+  public void cleanup() throws IOException {
     if (serverInitialized) {
       CountDownLatch shutdownLatch = new CountDownLatch(serverList.size());
       for (AmbryServer server : serverList) {
         new Thread(new ServerShutdown(shutdownLatch, server)).start();
       }
       try {
-        shutdownLatch.await();
+        if (!shutdownLatch.await(1, TimeUnit.MINUTES)) {
+          fail("Did not shutdown in 1 minute");
+        }
       } catch (Exception e) {
-        assertTrue(false);
+        throw new IOException(e);
       }
       clusterMap.cleanup();
     }
-  }
-
-  /**
-   * Find the value for sslEnabledDatacenter config for the given datacenter
-   * @param datacenter for which sslEnabledDatacenter config value has to be determinded
-   * @param sslEnabledDataCenterList list of datacenters upon which ssl should be enabled
-   * @return the config value for sslEnabledDatacenters for the given datacenter
-   */
-  private String getSSLEnabledDatacenterValue(String datacenter, ArrayList<String> sslEnabledDataCenterList) {
-    ArrayList<String> localCopy = new ArrayList<String>(sslEnabledDataCenterList);
-    localCopy.remove(datacenter);
-    return Utils.concatenateString(localCopy, ",");
   }
 
   public List<DataNodeId> getOneDataNodeFromEachDatacenter(ArrayList<String> datacenterList) {
@@ -170,13 +202,171 @@ class ServerShutdown implements Runnable {
   }
 }
 
-class Tracker {
-  public CountDownLatch totalReplicasDeleted;
-  public CountDownLatch totalReplicasCreated;
+/**
+ * Tracks the arrival of events and allows waiting on all events of a particular type to arrive
+ */
+class EventTracker {
+  private final int numberOfReplicas;
+  private final Helper creationHelper;
+  private final Helper deletionHelper;
+  private final ConcurrentMap<UpdateType, Helper> updateHelpers = new ConcurrentHashMap<>();
 
-  public Tracker(int expectedNumberOfReplicas) {
-    totalReplicasDeleted = new CountDownLatch(expectedNumberOfReplicas);
-    totalReplicasCreated = new CountDownLatch(expectedNumberOfReplicas);
+  /**
+   * Helper class that encapsulates the information needed to track a type of event
+   */
+  private class Helper {
+    private final ConcurrentHashMap<String, Boolean> hosts = new ConcurrentHashMap<>();
+    private final AtomicInteger notificationsReceived = new AtomicInteger(0);
+    private CountDownLatch latch = new CountDownLatch(numberOfReplicas);
+
+    /**
+     * Tracks the event that arrived on {@code host}:{@code port}.
+     * @param host the host that received the event
+     * @param port the port of the host that describes the instance along with {@code host}.
+     */
+    void track(String host, int port) {
+      notificationsReceived.incrementAndGet();
+      if (hosts.putIfAbsent(getKey(host, port), true) == null) {
+        latch.countDown();
+      }
+    }
+
+    /**
+     * Waits until the all replicas receive the event.
+     * @param duration the duration to wait for all the events to arrive
+     * @param timeUnit the time unit of {@code duration}
+     * @return {@code true} if events were received in all replicas within the {@code duration} specified.
+     * @throws InterruptedException
+     */
+    boolean await(long duration, TimeUnit timeUnit) throws InterruptedException {
+      return latch.await(duration, timeUnit);
+    }
+
+    /**
+     * Nullifies the notification received (if any) on the given {@code host}:{@code port}.
+     * This method is NOT thread safe and should not be used concurrently with other methods in this class like
+     * await() and track().
+     * @param host the host that to decrement on
+     * @param port the port of the host that describes the instance along with {@code host}.
+     */
+    void decrementCount(String host, int port) {
+      if (hosts.remove(getKey(host, port)) != null) {
+        long finalCount = latch.getCount() + 1;
+        if (finalCount > numberOfReplicas) {
+          throw new IllegalArgumentException("Cannot add more replicas than the max possible replicas");
+        }
+        latch = new CountDownLatch((int) finalCount);
+      }
+    }
+
+    /**
+     * @param host the host that received the event
+     * @param port the port of the host that describes the instance along with {@code host}.
+     * @return the unique key created for this host:port
+     */
+    private String getKey(String host, int port) {
+      return host + ":" + port;
+    }
+  }
+
+  /**
+   * @param expectedNumberOfReplicas the total number of replicas that will fire events
+   */
+  EventTracker(int expectedNumberOfReplicas) {
+    numberOfReplicas = expectedNumberOfReplicas;
+    creationHelper = new Helper();
+    deletionHelper = new Helper();
+  }
+
+  /**
+   * Tracks the creation event that arrived on {@code host}:{@code port}.
+   * @param host the host that received the create
+   * @param port the port of the host that describes the instance along with {@code host}.
+   */
+  void trackCreation(String host, int port) {
+    creationHelper.track(host, port);
+  }
+
+  /**
+   * Tracks the deletion event that arrived on {@code host}:{@code port}.
+   * @param host the host that received the delete
+   * @param port the port of the host that describes the instance along with {@code host}.
+   */
+  void trackDeletion(String host, int port) {
+    deletionHelper.track(host, port);
+  }
+
+  /**
+   * Tracks the update event of type {@code updateType} that arrived on {@code host}:{@code port}.
+   * @param host the host that received the update
+   * @param port the port of the host that describes the instance along with {@code host}.
+   * @param updateType the {@link UpdateType} received
+   */
+  void trackUpdate(String host, int port, UpdateType updateType) {
+    updateHelpers.computeIfAbsent(updateType, type -> new Helper()).track(host, port);
+  }
+
+  /**
+   * Waits for blob creations on all replicas
+   * @return {@code true} if creations were received in all replicas within the {@code duration} specified.
+   * @throws InterruptedException
+   */
+  boolean awaitBlobCreations() throws InterruptedException {
+    return creationHelper.await(10, TimeUnit.SECONDS);
+  }
+
+  /**
+   * Waits for blob deletions on all replicas
+   * @return {@code true} if deletions were received in all replicas within the {@code duration} specified.
+   * @throws InterruptedException
+   */
+  boolean awaitBlobDeletions() throws InterruptedException {
+    return deletionHelper.await(10, TimeUnit.SECONDS);
+  }
+
+  /**
+   * Waits for blob updates of type {@code updateType} on all replicas
+   * @param updateType the type of update to wait for
+   * @return {@code true} if updates of type {@code updateType} were received in all replicas within the
+   * {@code duration} specified.
+   * @throws InterruptedException
+   */
+  boolean awaitBlobUpdates(UpdateType updateType) throws InterruptedException {
+    return updateHelpers.computeIfAbsent(updateType, type -> new Helper()).await(10, TimeUnit.SECONDS);
+  }
+
+  /**
+   * Nullifies the creation notification on {@code host}:{@code port}.
+   * This method is NOT thread safe and should not be used concurrently with other methods in this class like
+   * await() and track().
+   * @param host the host that to decrement on
+   * @param port the port of the host that describes the instance along with {@code host}.
+   */
+  void decrementCreated(String host, int port) {
+    creationHelper.decrementCount(host, port);
+  }
+
+  /**
+   * Nullifies the delete notification on {@code host}:{@code port}.
+   * This method is NOT thread safe and should not be used concurrently with other methods in this class like
+   * await() and track().
+   * @param host the host that to decrement on
+   * @param port the port of the host that describes the instance along with {@code host}.
+   */
+  void decrementDeleted(String host, int port) {
+    deletionHelper.decrementCount(host, port);
+  }
+
+  /**
+   * Nullifies the update notification for {@code updateType} on {@code host}:{@code port}.
+   * This method is NOT thread safe and should not be used concurrently with other methods in this class like
+   * await() and track().
+   * @param host the host that to decrement on
+   * @param port the port of the host that describes the instance along with {@code host}.
+   * @param updateType the {@link UpdateType} to nullify the notification for
+   */
+  void decrementUpdated(String host, int port, UpdateType updateType) {
+    updateHelpers.computeIfAbsent(updateType, type -> new Helper()).decrementCount(host, port);
   }
 }
 
@@ -186,94 +376,144 @@ class Tracker {
  */
 class MockNotificationSystem implements NotificationSystem {
 
-  ConcurrentHashMap<String, Tracker> objectTracker = new ConcurrentHashMap<String, Tracker>();
-  int numberOfReplicas;
+  private final ConcurrentHashMap<String, EventTracker> objectTracker = new ConcurrentHashMap<String, EventTracker>();
+  private final ClusterMap clusterMap;
 
-  public MockNotificationSystem(int numberOfReplicas) {
-    this.numberOfReplicas = numberOfReplicas;
+  public MockNotificationSystem(ClusterMap clusterMap) {
+    this.clusterMap = clusterMap;
   }
 
   @Override
-  public void onBlobCreated(String blobId, BlobProperties blobProperties, byte[] userMetadata) {
+  public void onBlobCreated(String blobId, BlobProperties blobProperties, Account account, Container container,
+      NotificationBlobType notificationBlobType) {
     // ignore
   }
 
   @Override
-  public void onBlobDeleted(String blobId) {
+  public void onBlobTtlUpdated(String blobId, String serviceId, long expiresAtMs, Account account,
+      Container container) {
+    // ignore
+  }
+
+  @Override
+  public void onBlobDeleted(String blobId, String serviceId, Account account, Container container) {
     // ignore
   }
 
   @Override
   public synchronized void onBlobReplicaCreated(String sourceHost, int port, String blobId,
       BlobReplicaSourceType sourceType) {
-    Tracker tracker = objectTracker.get(blobId);
-    if (tracker == null) {
-      tracker = new Tracker(numberOfReplicas);
-      objectTracker.put(blobId, tracker);
-    }
-    tracker.totalReplicasCreated.countDown();
+    objectTracker.computeIfAbsent(blobId, k -> new EventTracker(getNumReplicas(blobId)))
+        .trackCreation(sourceHost, port);
   }
 
   @Override
   public synchronized void onBlobReplicaDeleted(String sourceHost, int port, String blobId,
       BlobReplicaSourceType sourceType) {
-    Tracker tracker = objectTracker.get(blobId);
-    tracker.totalReplicasDeleted.countDown();
+    objectTracker.computeIfAbsent(blobId, k -> new EventTracker(getNumReplicas(blobId)))
+        .trackDeletion(sourceHost, port);
   }
 
   @Override
-  public void close()
-      throws IOException {
+  public synchronized void onBlobReplicaUpdated(String sourceHost, int port, String blobId,
+      BlobReplicaSourceType sourceType, UpdateType updateType, MessageInfo info) {
+    objectTracker.computeIfAbsent(blobId, k -> new EventTracker(getNumReplicas(blobId)))
+        .trackUpdate(sourceHost, port, updateType);
+  }
+
+  @Override
+  public void close() {
     // ignore
   }
 
-  public void awaitBlobCreations(String blobId) {
+  /**
+   * Waits for blob creations on all replicas for {@code blobId}
+   * @param blobId the ID of the blob
+   */
+  void awaitBlobCreations(String blobId) {
     try {
-      Tracker tracker = objectTracker.get(blobId);
-      if (!tracker.totalReplicasCreated.await(2, TimeUnit.SECONDS)) {
-        Assert.fail(
-            "Failed awaiting for " + blobId + " creations, current count " + tracker.totalReplicasCreated.getCount());
+      if (!objectTracker.get(blobId).awaitBlobCreations()) {
+        Assert.fail("Failed awaiting for " + blobId + " creations");
       }
     } catch (InterruptedException e) {
       // ignore
     }
   }
 
-  public void awaitBlobDeletions(String blobId) {
+  /**
+   * Waits for blob deletions on all replicas for {@code blobId}
+   * @param blobId the ID of the blob
+   */
+  void awaitBlobDeletions(String blobId) {
     try {
-      Tracker tracker = objectTracker.get(blobId);
-      if (!tracker.totalReplicasDeleted.await(2, TimeUnit.SECONDS)) {
-        Assert.fail(
-            "Failed awaiting for " + blobId + " deletions, current count " + tracker.totalReplicasDeleted.getCount());
+      if (!objectTracker.get(blobId).awaitBlobDeletions()) {
+        Assert.fail("Failed awaiting for " + blobId + " deletions");
       }
     } catch (InterruptedException e) {
       // ignore
     }
   }
 
-  public synchronized void decrementCreatedReplica(String blobId) {
-    Tracker tracker = objectTracker.get(blobId);
-    long currentCount = tracker.totalReplicasCreated.getCount();
-    long finalCount = currentCount + 1;
-    if (finalCount > numberOfReplicas) {
-      throw new IllegalArgumentException("Cannot add more replicas than the max possible replicas");
-    }
-    tracker.totalReplicasCreated = new CountDownLatch(numberOfReplicas);
-    while (tracker.totalReplicasCreated.getCount() > finalCount) {
-      tracker.totalReplicasCreated.countDown();
+  /**
+   * Waits for blob updates of type {@code updateType} on all replicas for {@code blobId}
+   * @param blobId the ID of the blob
+   * @param updateType the {@link UpdateType} to wait for
+   */
+  void awaitBlobUpdates(String blobId, UpdateType updateType) {
+    try {
+      if (!objectTracker.get(blobId).awaitBlobUpdates(updateType)) {
+        Assert.fail("Failed awaiting for " + blobId + " updates of type " + updateType);
+      }
+    } catch (InterruptedException e) {
+      // ignore
     }
   }
 
-  public synchronized void decrementDeletedReplica(String blobId) {
-    Tracker tracker = objectTracker.get(blobId);
-    long currentCount = tracker.totalReplicasDeleted.getCount();
-    long finalCount = currentCount + 1;
-    if (finalCount > numberOfReplicas) {
-      throw new IllegalArgumentException("Cannot add more replicas than the max possible replicas");
-    }
-    tracker.totalReplicasDeleted = new CountDownLatch(numberOfReplicas);
-    while (tracker.totalReplicasDeleted.getCount() > finalCount) {
-      tracker.totalReplicasDeleted.countDown();
+  /**
+   * Nullifies the creation notification for {@code blobId} on {@code host}:{@code port}.
+   * This method should not be used concurrently with the await functions
+   * @param blobId the blob ID whose creation notification needs to be nullified
+   * @param host the host that to decrement on
+   * @param port the port of the host that describes the instance along with {@code host}.
+   */
+  synchronized void decrementCreatedReplica(String blobId, String host, int port) {
+    objectTracker.get(blobId).decrementCreated(host, port);
+  }
+
+  /**
+   * Nullifies the deletion notification for {@code blobId} on {@code host}:{@code port}.
+   * This method should not be used concurrently with the await functions
+   * @param blobId the blob ID whose deletion notification needs to be nullified
+   * @param host the host that to decrement on
+   * @param port the port of the host that describes the instance along with {@code host}.
+   */
+  synchronized void decrementDeletedReplica(String blobId, String host, int port) {
+    objectTracker.get(blobId).decrementDeleted(host, port);
+  }
+
+  /**
+   * Nullifies the update notification of type {@code updateType} for {@code blobId} on {@code host}:{@code port}.
+   * This method should not be used concurrently with the await functions
+   * @param blobId the blob ID whose update notification needs to be nullified
+   * @param host the host that to decrement on
+   * @param port the port of the host that describes the instance along with {@code host}.
+   * @param updateType the {@link UpdateType} to nullify the notification for
+   */
+  synchronized void decrementUpdatedReplica(String blobId, String host, int port, UpdateType updateType) {
+    objectTracker.get(blobId).decrementDeleted(host, port);
+  }
+
+  /**
+   * @param blobId the blob ID received
+   * @return the number of replicas of {@code blobId}
+   */
+  private int getNumReplicas(String blobId) {
+    try {
+      BlobId blobIdObj = new BlobId(blobId, clusterMap);
+      PartitionId partitionId = blobIdObj.getPartition();
+      return partitionId.getReplicaIds().size();
+    } catch (Exception e) {
+      throw new IllegalArgumentException("Invalid blob ID: " + blobId, e);
     }
   }
 }

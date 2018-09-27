@@ -53,7 +53,9 @@ public class SSLConfig {
   public final String sslClientAuthentication;
 
   /**
-   * The SSL keymanager algorithm
+   * The SSL keymanager algorithm.
+   * This is only honored by {@code JdkSslFactory}. {@code NettySslFactory} always uses the default value to maintain
+   * compatibility with the OpenSSL-based engine.
    */
   @Config("ssl.keymanager.algorithm")
   @Default("")
@@ -61,6 +63,8 @@ public class SSLConfig {
 
   /**
    * The SSL trustmanager algorithm
+   * This is only honored by {@code JdkSslFactory}. {@code NettySslFactory} always uses the default value to maintain
+   * compatibility with the OpenSSL-based engine.
    */
   @Config("ssl.trustmanager.algorithm")
   @Default("")
@@ -126,11 +130,11 @@ public class SSLConfig {
   public final String sslCipherSuites;
 
   /**
-   * List of Datacenters to which local node needs SSL encryption to communicate
+   * The implementation of {@link com.github.ambry.commons.SSLFactory} to use.
    */
-  @Config("ssl.enabled.datacenters")
-  @Default("")
-  public final String sslEnabledDatacenters;
+  @Config("ssl.factory")
+  @Default("com.github.ambry.commons.JdkSslFactory")
+  public final String sslFactory;
 
   public SSLConfig(VerifiableProperties verifiableProperties) {
     sslContextProtocol = verifiableProperties.getString("ssl.context.protocol", "TLS");
@@ -148,6 +152,6 @@ public class SSLConfig {
     sslTruststorePath = verifiableProperties.getString("ssl.truststore.path", "");
     sslTruststorePassword = verifiableProperties.getString("ssl.truststore.password", "");
     sslCipherSuites = verifiableProperties.getString("ssl.cipher.suites", "");
-    sslEnabledDatacenters = verifiableProperties.getString("ssl.enabled.datacenters", "");
+    sslFactory = verifiableProperties.getString("ssl.factory", "com.github.ambry.commons.JdkSslFactory");
   }
 }

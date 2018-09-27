@@ -17,15 +17,18 @@ import java.io.DataInputStream;
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.Random;
+import java.util.concurrent.Callable;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import org.apache.commons.io.FileUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import static org.junit.Assert.*;
 
 
 /**
@@ -65,8 +68,7 @@ public class UtilsTest {
   }
 
   @Test
-  public void testReadStrings()
-      throws IOException {
+  public void testReadStrings() throws IOException {
     // good case
     ByteBuffer buffer = ByteBuffer.allocate(10);
     buffer.putShort((short) 8);
@@ -138,8 +140,7 @@ public class UtilsTest {
   }
 
   @Test
-  public void testReadBuffers()
-      throws IOException {
+  public void testReadBuffers() throws IOException {
     byte[] buf = new byte[40004];
     new Random().nextBytes(buf);
     ByteBuffer inputBuf = ByteBuffer.wrap(buf);
@@ -200,13 +201,66 @@ public class UtilsTest {
   }
 
   @Test
-  public void testReadWriteStringToFile()
-      throws IOException {
+  public void testReadWriteStringToFile() throws IOException {
     File file = File.createTempFile("test", "1");
     file.deleteOnExit();
     Utils.writeStringToFile("Test", file.getPath());
     String outputString = Utils.readStringFromFile(file.getPath());
     Assert.assertEquals("Test", outputString);
+  }
+
+  @Test
+  public void testReadFileToByteBuffer() throws IOException {
+    File file = File.createTempFile("test", "1");
+    file.deleteOnExit();
+    FileChannel fileChannel = Utils.openChannel(file, false);
+    byte[] referenceBytes = new byte[20];
+    new Random().nextBytes(referenceBytes);
+    FileUtils.writeByteArrayToFile(file, referenceBytes);
+
+    // fill up fresh byteBuffer
+    ByteBuffer buffer = ByteBuffer.allocate(20);
+    Utils.readFileToByteBuffer(fileChannel, 0, buffer);
+    assertArrayEquals("Data mismatch", referenceBytes, buffer.array());
+
+    // write to byteBuffer based on buffer remaining
+    buffer.limit(10);
+    buffer.position(0);
+    assertEquals("buffer remaining should be 10", 10, buffer.remaining());
+    Utils.readFileToByteBuffer(fileChannel, 10, buffer);
+    assertEquals("buffer remaining should be 0", 0, buffer.remaining());
+    for (int i = 0; i < 10; i++) {
+      assertEquals("First 10 bytes in buffer should match last 10 bytes in file", buffer.array()[i],
+          referenceBytes[i + 10]);
+    }
+
+    // byteBuffer.remaining() + starting offset > file size, exception is expected.
+    buffer.clear();
+    assertEquals("buffer remaining should be 20", 20, buffer.remaining());
+    try {
+      Utils.readFileToByteBuffer(fileChannel, 1, buffer);
+      fail("Should fail");
+    } catch (IOException e) {
+    }
+
+    // starting offset exceeds file size, exception is expected.
+    buffer.clear();
+    assertEquals("buffer remaining should be 20", 20, buffer.remaining());
+    try {
+      Utils.readFileToByteBuffer(fileChannel, 21, buffer);
+      fail("Should fail");
+    } catch (IOException e) {
+    }
+  }
+
+  @Test
+  public void testGetIntStringLength() {
+    for (int i = 0; i < 10; i++) {
+      String value = getRandomString(1000 + TestUtils.RANDOM.nextInt(10000));
+      assertEquals("Size mismatch ", Integer.BYTES + value.length(), Utils.getIntStringLength(value));
+    }
+    assertEquals("Size mismatch for empty string ", Integer.BYTES, Utils.getIntStringLength(""));
+    assertEquals("Size mismatch for null string ", Integer.BYTES, Utils.getIntStringLength(null));
   }
 
   @Test
@@ -340,8 +394,8 @@ public class UtilsTest {
       mockObj = Utils.getObj("com.github.ambry.utils.MockClassForTesting", new Object(), new Object(), new Object());
       Assert.assertNotNull(mockObj);
       Assert.assertTrue(mockObj.threeArgConstructorInvoked);
-      mockObj = Utils
-          .getObj("com.github.ambry.utils.MockClassForTesting", new Object(), new Object(), new Object(), new Object());
+      mockObj = Utils.getObj("com.github.ambry.utils.MockClassForTesting", new Object(), new Object(), new Object(),
+          new Object());
       Assert.assertNotNull(mockObj);
       Assert.assertTrue(mockObj.fourArgConstructorInvoked);
     } catch (Exception e) {
@@ -349,10 +403,11 @@ public class UtilsTest {
     }
   }
 
-  @Test
   /**
    * Tests {@link Utils#getRootCause(Throwable)}.
-   */ public void getRootCauseTest() {
+   */
+  @Test
+  public void getRootCauseTest() {
     int nestingLevel = 5;
     String innerExceptionMsg = "InnerException";
     String outerExceptionMsgBase = "OuterException";
@@ -363,6 +418,108 @@ public class UtilsTest {
     }
     assertEquals("Message should that of the innermost exception", innerExceptionMsg,
         Utils.getRootCause(outerException).getMessage());
+  }
+
+  /**
+   * Test {@link Utils#newScheduler(int, String, boolean)}
+   */
+  @Test
+  public void newSchedulerTest() throws Exception {
+    ScheduledExecutorService scheduler = Utils.newScheduler(2, false);
+    Future<String> future = scheduler.schedule(new Callable<String>() {
+      @Override
+      public String call() {
+        return Thread.currentThread().getName();
+      }
+    }, 50, TimeUnit.MILLISECONDS);
+    String threadName = future.get(10, TimeUnit.SECONDS);
+    assertTrue("Unexpected thread name returned: " + threadName, threadName.startsWith("ambry-scheduler-"));
+    scheduler.shutdown();
+  }
+
+  /**
+   * Test {@link Utils#getTimeInMsToTheNearestSec(long)}
+   */
+  @Test
+  public void getTimeInMsToTheNearestSecTest() {
+    long msValue = Utils.getRandomLong(TestUtils.RANDOM, 1000000);
+    long expectedMsValue = (msValue / Time.MsPerSec) * Time.MsPerSec;
+    assertEquals("Time in Ms to the nearest Sec mismatch ", expectedMsValue, Utils.getTimeInMsToTheNearestSec(msValue));
+    msValue = Utils.Infinite_Time;
+    assertEquals("Time in Ms to the nearest Sec mismatch ", msValue, Utils.getTimeInMsToTheNearestSec(msValue));
+  }
+
+  /**
+   * Tests {@link Utils#addSecondsToEpochTime(long, long)}
+   */
+  @Test
+  public void addSecondsToEpochTimeTest() {
+    for (int i = 0; i < 5; i++) {
+      long epochTimeInMs = SystemTime.getInstance().milliseconds() + TestUtils.RANDOM.nextInt(10000);
+      long deltaInSecs = TestUtils.RANDOM.nextInt(10000);
+      assertEquals("epoch epochTimeInMs mismatch ", epochTimeInMs + (deltaInSecs * Time.MsPerSec),
+          Utils.addSecondsToEpochTime(epochTimeInMs, deltaInSecs));
+      assertEquals("epoch epochTimeInMs mismatch ", Utils.Infinite_Time,
+          Utils.addSecondsToEpochTime(Utils.Infinite_Time, deltaInSecs));
+      assertEquals("epoch epochTimeInMs mismatch ", Utils.Infinite_Time,
+          Utils.addSecondsToEpochTime(epochTimeInMs, Utils.Infinite_Time));
+    }
+  }
+
+  /**
+   * Tests for {@link Utils#isPossibleClientTermination(Throwable)} and
+   * {@link Utils#convertToClientTerminationException(Throwable)}.
+   */
+  @Test
+  public void clientTerminationWrapAndRecognizeTest() {
+    Exception exception = new IOException("Connection reset by peer");
+    assertTrue("Should be declared as a client termination", Utils.isPossibleClientTermination(exception));
+
+    exception = new IOException("Broken pipe");
+    assertTrue("Should be declared as a client termination", Utils.isPossibleClientTermination(exception));
+
+    exception = new IOException("Connection not reset by peer");
+    assertFalse("Should not be declared as a client termination", Utils.isPossibleClientTermination(exception));
+    exception = Utils.convertToClientTerminationException(exception);
+    assertTrue("Should be declared as a client termination", Utils.isPossibleClientTermination(exception));
+
+    exception = new Exception("Connection reset by peer");
+    // debatable but this is the current implementation.
+    assertFalse("Should not be declared as a client termination", Utils.isPossibleClientTermination(exception));
+    exception = Utils.convertToClientTerminationException(exception);
+    assertTrue("Should be declared as a client termination", Utils.isPossibleClientTermination(exception));
+  }
+
+  /**
+   * Tests for {@link Utils#getTtlInSecsFromExpiryMs(long, long)}.
+   */
+  @Test
+  public void getTtlInSecsFromExpiryMsTest() {
+    long creationTimeMs = SystemTime.getInstance().milliseconds();
+    for (long ttlInSecs : new long[]{1, 20, 1000, Integer.MAX_VALUE, Utils.Infinite_Time, -100, -(
+        TimeUnit.MILLISECONDS.toSeconds(creationTimeMs) + 1)}) {
+      long expectedTtlSecs = ttlInSecs;
+      if (ttlInSecs == Utils.Infinite_Time) {
+        expectedTtlSecs = Utils.Infinite_Time;
+      } else if (ttlInSecs < 0) {
+        expectedTtlSecs = 0;
+      }
+      long expiresAtMs = Utils.addSecondsToEpochTime(creationTimeMs, ttlInSecs);
+      long returnedTtlSecs = Utils.getTtlInSecsFromExpiryMs(expiresAtMs, creationTimeMs);
+      assertEquals("TTL not as expected", expectedTtlSecs, returnedTtlSecs);
+    }
+  }
+
+  /**
+   * Tests for {@link Utils#isNullOrEmpty(String)}.
+   */
+  @Test
+  public void isNullOrEmptyTest() {
+    assertTrue("String should be declared null", Utils.isNullOrEmpty(null));
+    assertTrue("String should be declared empty", Utils.isNullOrEmpty(""));
+    assertFalse("String should not be declared empty", Utils.isNullOrEmpty(" "));
+    assertFalse("String should not be declared empty", Utils.isNullOrEmpty("a"));
+    assertFalse("String should not be declared empty", Utils.isNullOrEmpty(getRandomString(10)));
   }
 
   private static final String CHARACTERS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";

@@ -14,12 +14,20 @@
 package com.github.ambry.rest;
 
 import com.codahale.metrics.MetricRegistry;
+import com.github.ambry.account.Account;
+import com.github.ambry.account.Container;
+import com.github.ambry.clustermap.MockClusterMap;
 import com.github.ambry.config.NettyConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.messageformat.BlobProperties;
 import com.github.ambry.notification.BlobReplicaSourceType;
+import com.github.ambry.notification.NotificationBlobType;
 import com.github.ambry.notification.NotificationSystem;
+import com.github.ambry.notification.UpdateType;
 import com.github.ambry.router.InMemoryRouter;
+import com.github.ambry.store.MessageInfo;
+import com.github.ambry.utils.TestUtils;
+import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.DecoderResult;
@@ -28,11 +36,11 @@ import io.netty.handler.codec.http.DefaultHttpContent;
 import io.netty.handler.codec.http.DefaultHttpResponse;
 import io.netty.handler.codec.http.DefaultLastHttpContent;
 import io.netty.handler.codec.http.HttpContent;
-import io.netty.handler.codec.http.HttpHeaders;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpRequest;
 import io.netty.handler.codec.http.HttpResponse;
 import io.netty.handler.codec.http.HttpResponseStatus;
+import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.LastHttpContent;
 import io.netty.handler.codec.http.multipart.DefaultHttpDataFactory;
@@ -77,11 +85,10 @@ public class NettyMessageProcessorTest {
    * @throws InstantiationException
    * @throws IOException
    */
-  public NettyMessageProcessorTest()
-      throws InstantiationException, IOException {
+  public NettyMessageProcessorTest() throws InstantiationException, IOException {
     VerifiableProperties verifiableProperties = new VerifiableProperties(new Properties());
     RestRequestMetricsTracker.setDefaults(new MetricRegistry());
-    router = new InMemoryRouter(verifiableProperties, notificationSystem);
+    router = new InMemoryRouter(verifiableProperties, notificationSystem, new MockClusterMap());
     requestHandler = new MockRestRequestResponseHandler();
     blobStorageService = new MockBlobStorageService(verifiableProperties, requestHandler, router);
     requestHandler.setBlobStorageService(blobStorageService);
@@ -93,8 +100,7 @@ public class NettyMessageProcessorTest {
    * Clean up task.
    */
   @After
-  public void cleanUp()
-      throws IOException {
+  public void cleanUp() throws IOException {
     blobStorageService.shutdown();
     router.close();
     notificationSystem.close();
@@ -105,8 +111,7 @@ public class NettyMessageProcessorTest {
    * @throws IOException
    */
   @Test
-  public void requestHandleWithGoodInputTest()
-      throws IOException {
+  public void requestHandleWithGoodInputTest() throws IOException {
     doRequestHandleWithoutKeepAlive(HttpMethod.GET, RestMethod.GET);
     doRequestHandleWithoutKeepAlive(HttpMethod.DELETE, RestMethod.DELETE);
     doRequestHandleWithoutKeepAlive(HttpMethod.HEAD, RestMethod.HEAD);
@@ -122,15 +127,13 @@ public class NettyMessageProcessorTest {
    * @throws InterruptedException
    */
   @Test
-  public void rawBytesPostTest()
-      throws InterruptedException {
+  public void rawBytesPostTest() throws InterruptedException {
     Random random = new Random();
     // request also contains content.
-    ByteBuffer content = ByteBuffer.wrap(RestTestUtils.getRandomBytes(random.nextInt(128) + 128));
+    ByteBuffer content = ByteBuffer.wrap(TestUtils.getRandomBytes(random.nextInt(128) + 128));
     HttpRequest postRequest =
         new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.POST, "/", Unpooled.wrappedBuffer(content));
-    HttpHeaders.setHeader(postRequest, RestUtils.Headers.SERVICE_ID, "rawBytesPostTest");
-    HttpHeaders.setHeader(postRequest, RestUtils.Headers.BLOB_SIZE, content.remaining());
+    postRequest.headers().set(RestUtils.Headers.SERVICE_ID, "rawBytesPostTest");
     postRequest = ReferenceCountUtil.retain(postRequest);
     ByteBuffer receivedContent = doPostTest(postRequest, null);
     compareContent(receivedContent, Collections.singletonList(content));
@@ -141,12 +144,11 @@ public class NettyMessageProcessorTest {
     List<ByteBuffer> contents = new ArrayList<ByteBuffer>(NUM_CONTENTS);
     int blobSize = 0;
     for (int i = 0; i < NUM_CONTENTS; i++) {
-      ByteBuffer buffer = ByteBuffer.wrap(RestTestUtils.getRandomBytes(random.nextInt(128) + 128));
+      ByteBuffer buffer = ByteBuffer.wrap(TestUtils.getRandomBytes(random.nextInt(128) + 128));
       blobSize += buffer.remaining();
       contents.add(i, buffer);
     }
-    HttpHeaders.setHeader(postRequest, RestUtils.Headers.SERVICE_ID, "rawBytesPostTest");
-    HttpHeaders.setHeader(postRequest, RestUtils.Headers.BLOB_SIZE, blobSize);
+    postRequest.headers().set(RestUtils.Headers.SERVICE_ID, "rawBytesPostTest");
     receivedContent = doPostTest(postRequest, contents);
     compareContent(receivedContent, contents);
   }
@@ -156,19 +158,17 @@ public class NettyMessageProcessorTest {
    * @throws Exception
    */
   @Test
-  public void multipartPostTest()
-      throws Exception {
+  public void multipartPostTest() throws Exception {
     Random random = new Random();
-    ByteBuffer content = ByteBuffer.wrap(RestTestUtils.getRandomBytes(random.nextInt(128) + 128));
+    ByteBuffer content = ByteBuffer.wrap(TestUtils.getRandomBytes(random.nextInt(128) + 128));
     HttpRequest httpRequest = RestTestUtils.createRequest(HttpMethod.POST, "/", null);
-    HttpHeaders.setHeader(httpRequest, RestUtils.Headers.SERVICE_ID, "rawBytesPostTest");
-    HttpHeaders.setHeader(httpRequest, RestUtils.Headers.BLOB_SIZE, content.remaining());
+    httpRequest.headers().set(RestUtils.Headers.SERVICE_ID, "rawBytesPostTest");
     HttpPostRequestEncoder encoder = createEncoder(httpRequest, content);
     HttpRequest postRequest = encoder.finalizeRequest();
     List<ByteBuffer> contents = new ArrayList<ByteBuffer>();
     while (!encoder.isEndOfInput()) {
       // Sending null for ctx because the encoder is OK with that.
-      contents.add(encoder.readChunk(null).content().nioBuffer());
+      contents.add(encoder.readChunk(PooledByteBufAllocator.DEFAULT).content().nioBuffer());
     }
     ByteBuffer receivedContent = doPostTest(postRequest, contents);
     compareContent(receivedContent, Collections.singletonList(content));
@@ -178,14 +178,13 @@ public class NettyMessageProcessorTest {
    * Tests for error handling flow when bad input streams are provided to the {@link NettyMessageProcessor}.
    */
   @Test
-  public void requestHandleWithBadInputTest()
-      throws IOException {
+  public void requestHandleWithBadInputTest() throws IOException {
     String content = "@@randomContent@@@";
     // content without request.
     EmbeddedChannel channel = createChannel();
     channel.writeInbound(new DefaultLastHttpContent(Unpooled.wrappedBuffer(content.getBytes())));
     HttpResponse response = (HttpResponse) channel.readOutbound();
-    assertEquals("Unexpected response status", HttpResponseStatus.BAD_REQUEST, response.getStatus());
+    assertEquals("Unexpected response status", HttpResponseStatus.BAD_REQUEST, response.status());
     assertFalse("Channel is not closed", channel.isOpen());
 
     // content without request on a channel that was kept alive
@@ -194,7 +193,7 @@ public class NettyMessageProcessorTest {
     channel.writeInbound(RestTestUtils.createRequest(HttpMethod.GET, MockBlobStorageService.ECHO_REST_METHOD, null));
     channel.writeInbound(LastHttpContent.EMPTY_LAST_CONTENT);
     response = (HttpResponse) channel.readOutbound();
-    assertEquals("Unexpected response status", HttpResponseStatus.OK, response.getStatus());
+    assertEquals("Unexpected response status", HttpResponseStatus.OK, response.status());
     // drain the content
     while (channel.readOutbound() != null) {
       ;
@@ -203,7 +202,7 @@ public class NettyMessageProcessorTest {
     // send content without request
     channel.writeInbound(LastHttpContent.EMPTY_LAST_CONTENT);
     response = (HttpResponse) channel.readOutbound();
-    assertEquals("Unexpected response status", HttpResponseStatus.BAD_REQUEST, response.getStatus());
+    assertEquals("Unexpected response status", HttpResponseStatus.BAD_REQUEST, response.status());
     assertFalse("Channel is not closed", channel.isOpen());
 
     // content when no content is expected.
@@ -211,14 +210,14 @@ public class NettyMessageProcessorTest {
     channel.writeInbound(RestTestUtils.createRequest(HttpMethod.GET, "/", null));
     channel.writeInbound(new DefaultLastHttpContent(Unpooled.wrappedBuffer(content.getBytes())));
     response = (HttpResponse) channel.readOutbound();
-    assertEquals("Unexpected response status", HttpResponseStatus.BAD_REQUEST, response.getStatus());
+    assertEquals("Unexpected response status", HttpResponseStatus.BAD_REQUEST, response.status());
     assertFalse("Channel is not closed", channel.isOpen());
 
     // wrong HTTPObject.
     channel = createChannel();
     channel.writeInbound(new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK));
     response = (HttpResponse) channel.readOutbound();
-    assertEquals("Unexpected response status", HttpResponseStatus.BAD_REQUEST, response.getStatus());
+    assertEquals("Unexpected response status", HttpResponseStatus.BAD_REQUEST, response.status());
     assertFalse("Channel is not closed", channel.isOpen());
 
     // request while another request is in progress.
@@ -228,7 +227,7 @@ public class NettyMessageProcessorTest {
     // channel should be closed by now
     assertFalse("Channel is not closed", channel.isOpen());
     response = (HttpResponse) channel.readOutbound();
-    assertEquals("Unexpected response status", HttpResponseStatus.BAD_REQUEST, response.getStatus());
+    assertEquals("Unexpected response status", HttpResponseStatus.BAD_REQUEST, response.status());
 
     // decoding failure
     channel = createChannel();
@@ -238,15 +237,15 @@ public class NettyMessageProcessorTest {
     // channel should be closed by now
     assertFalse("Channel is not closed", channel.isOpen());
     response = (HttpResponse) channel.readOutbound();
-    assertEquals("Unexpected response status", HttpResponseStatus.BAD_REQUEST, response.getStatus());
+    assertEquals("Unexpected response status", HttpResponseStatus.BAD_REQUEST, response.status());
 
     // unsupported method
     channel = createChannel();
-    channel.writeInbound(RestTestUtils.createRequest(HttpMethod.OPTIONS, "/", null));
+    channel.writeInbound(RestTestUtils.createRequest(HttpMethod.TRACE, "/", null));
     // channel should be closed by now
     assertFalse("Channel is not closed", channel.isOpen());
     response = (HttpResponse) channel.readOutbound();
-    assertEquals("Unexpected response status", HttpResponseStatus.BAD_REQUEST, response.getStatus());
+    assertEquals("Unexpected response status", HttpResponseStatus.BAD_REQUEST, response.status());
   }
 
   /**
@@ -294,16 +293,15 @@ public class NettyMessageProcessorTest {
    * @throws IOException
    */
   private void sendRequestCheckResponse(EmbeddedChannel channel, HttpMethod httpMethod, RestMethod restMethod,
-      boolean isKeepAlive)
-      throws IOException {
+      boolean isKeepAlive) throws IOException {
     long requestId = REQUEST_ID_GENERATOR.getAndIncrement();
     String uri = MockBlobStorageService.ECHO_REST_METHOD + requestId;
     HttpRequest httpRequest = RestTestUtils.createRequest(httpMethod, uri, null);
-    HttpHeaders.setKeepAlive(httpRequest, isKeepAlive);
+    HttpUtil.setKeepAlive(httpRequest, isKeepAlive);
     channel.writeInbound(httpRequest);
     channel.writeInbound(new DefaultLastHttpContent());
     HttpResponse response = (HttpResponse) channel.readOutbound();
-    assertEquals("Unexpected response status", HttpResponseStatus.OK, response.getStatus());
+    assertEquals("Unexpected response status", HttpResponseStatus.OK, response.status());
     // MockBlobStorageService echoes the RestMethod + request id.
     String expectedResponse = restMethod.toString() + requestId;
     assertEquals("Unexpected content", expectedResponse,
@@ -319,14 +317,13 @@ public class NettyMessageProcessorTest {
    * @return the data stored in the {@link InMemoryRouter} as a result of the POST.
    * @throws InterruptedException
    */
-  private ByteBuffer doPostTest(HttpRequest postRequest, List<ByteBuffer> contentToSend)
-      throws InterruptedException {
+  private ByteBuffer doPostTest(HttpRequest postRequest, List<ByteBuffer> contentToSend) throws InterruptedException {
     EmbeddedChannel channel = createChannel();
 
     // POST
     notificationSystem.reset();
-    HttpHeaders.setHeader(postRequest, RestUtils.Headers.AMBRY_CONTENT_TYPE, "application/octet-stream");
-    HttpHeaders.setKeepAlive(postRequest, false);
+    postRequest.headers().set(RestUtils.Headers.AMBRY_CONTENT_TYPE, "application/octet-stream");
+    HttpUtil.setKeepAlive(postRequest, false);
     channel.writeInbound(postRequest);
     if (contentToSend != null) {
       for (ByteBuffer content : contentToSend) {
@@ -334,8 +331,8 @@ public class NettyMessageProcessorTest {
       }
       channel.writeInbound(LastHttpContent.EMPTY_LAST_CONTENT);
     }
-    if (!notificationSystem.operationCompleted.await(100, TimeUnit.MILLISECONDS)) {
-      fail("Post did not succeed after 100ms. There is an error or timeout needs to increase");
+    if (!notificationSystem.operationCompleted.await(1000, TimeUnit.MILLISECONDS)) {
+      fail("Post did not succeed after 1000ms. There is an error or timeout needs to increase");
     }
     assertNotNull("Blob id operated on cannot be null", notificationSystem.blobIdOperatedOn);
     return router.getActiveBlobs().get(notificationSystem.blobIdOperatedOn).getBlob();
@@ -367,8 +364,7 @@ public class NettyMessageProcessorTest {
    *                   response.
    * @throws IOException
    */
-  private void doRequestHandleWithoutKeepAlive(HttpMethod httpMethod, RestMethod restMethod)
-      throws IOException {
+  private void doRequestHandleWithoutKeepAlive(HttpMethod httpMethod, RestMethod restMethod) throws IOException {
     EmbeddedChannel channel = createChannel();
     sendRequestCheckResponse(channel, httpMethod, restMethod, false);
     assertFalse("Channel not closed", channel.isOpen());
@@ -425,7 +421,7 @@ public class NettyMessageProcessorTest {
     channel.writeInbound(new DefaultLastHttpContent());
     // first outbound has to be response.
     HttpResponse response = (HttpResponse) channel.readOutbound();
-    assertEquals("Unexpected response status", expectedStatus, response.getStatus());
+    assertEquals("Unexpected response status", expectedStatus, response.status());
   }
 
   /**
@@ -443,13 +439,20 @@ public class NettyMessageProcessorTest {
     protected volatile CountDownLatch operationCompleted = new CountDownLatch(1);
 
     @Override
-    public void onBlobCreated(String blobId, BlobProperties blobProperties, byte[] userMetadata) {
+    public void onBlobCreated(String blobId, BlobProperties blobProperties, Account account, Container container,
+        NotificationBlobType notificationBlobType) {
       blobIdOperatedOn = blobId;
       operationCompleted.countDown();
     }
 
     @Override
-    public void onBlobDeleted(String blobId) {
+    public void onBlobTtlUpdated(String blobId, String serviceId, long expiresAtMs, Account account,
+        Container container) {
+      throw new IllegalStateException("Not implemented");
+    }
+
+    @Override
+    public void onBlobDeleted(String blobId, String serviceId, Account account, Container container) {
       throw new IllegalStateException("Not implemented");
     }
 
@@ -460,6 +463,12 @@ public class NettyMessageProcessorTest {
 
     @Override
     public void onBlobReplicaDeleted(String sourceHost, int port, String blobId, BlobReplicaSourceType sourceType) {
+      throw new IllegalStateException("Not implemented");
+    }
+
+    @Override
+    public void onBlobReplicaUpdated(String sourceHost, int port, String blobId, BlobReplicaSourceType sourceType,
+        UpdateType updateType, MessageInfo info) {
       throw new IllegalStateException("Not implemented");
     }
 

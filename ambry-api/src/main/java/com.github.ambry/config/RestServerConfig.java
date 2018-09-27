@@ -63,6 +63,13 @@ public class RestServerConfig {
   public final String restServerResponseHandlerFactory;
 
   /**
+   * The AccountServiceFactory that needs to be used by AmbryBlobStorageService to get account-related information.
+   */
+  @Config("rest.server.account.service.factory")
+  @Default("com.github.ambry.account.InMemoryUnknownAccountServiceFactory")
+  public final String restServerAccountServiceFactory;
+
+  /**
    * The RouterFactory that needs to be used by the RestServer
    * for bootstrapping the Router.
    */
@@ -74,8 +81,7 @@ public class RestServerConfig {
    * Request Headers that needs to be logged as part of public access log entries
    */
   @Config("rest.server.public.access.log.request.headers")
-  @Default(
-      "Host,Referer,User-Agent,Content-Length,x-ambry-content-type,x-ambry-owner-id,x-ambry-ttl,x-ambry-private,x-ambry-service-id,X-Forwarded-For")
+  @Default("Host,Referer,User-Agent,Content-Length,x-ambry-content-type,x-ambry-owner-id,x-ambry-ttl,x-ambry-private,x-ambry-service-id,X-Forwarded-For")
   public final String restServerPublicAccessLogRequestHeaders;
 
   /**
@@ -98,16 +104,18 @@ public class RestServerConfig {
         verifiableProperties.getString("rest.server.nio.server.factory", "com.github.ambry.rest.NettyServerFactory");
     restServerRequestHandlerScalingUnitCount =
         verifiableProperties.getIntInRange("rest.server.request.handler.scaling.unit.count", 5, 0, Integer.MAX_VALUE);
-    restServerRequestHandlerFactory = verifiableProperties
-        .getString("rest.server.request.handler.factory", "com.github.ambry.rest.AsyncRequestResponseHandlerFactory");
+    restServerRequestHandlerFactory = verifiableProperties.getString("rest.server.request.handler.factory",
+        "com.github.ambry.rest.AsyncRequestResponseHandlerFactory");
     restServerResponseHandlerScalingUnitCount =
         verifiableProperties.getIntInRange("rest.server.response.handler.scaling.unit.count", 5, 0, Integer.MAX_VALUE);
-    restServerResponseHandlerFactory = verifiableProperties
-        .getString("rest.server.response.handler.factory", "com.github.ambry.rest.AsyncRequestResponseHandlerFactory");
-    restServerRouterFactory = verifiableProperties
-        .getString("rest.server.router.factory", "com.github.ambry.router.NonBlockingRouterFactory");
-    restServerPublicAccessLogRequestHeaders = verifiableProperties
-        .getString("rest.server.public.access.log.request.headers",
+    restServerResponseHandlerFactory = verifiableProperties.getString("rest.server.response.handler.factory",
+        "com.github.ambry.rest.AsyncRequestResponseHandlerFactory");
+    restServerAccountServiceFactory = verifiableProperties.getString("rest.server.account.service.factory",
+        "com.github.ambry.account.InMemoryUnknownAccountServiceFactory");
+    restServerRouterFactory = verifiableProperties.getString("rest.server.router.factory",
+        "com.github.ambry.router.NonBlockingRouterFactory");
+    restServerPublicAccessLogRequestHeaders =
+        verifiableProperties.getString("rest.server.public.access.log.request.headers",
             "Host,Referer,User-Agent,Content-Length,x-ambry-content-type,x-ambry-owner-id,x-ambry-ttl,x-ambry-private,x-ambry-service-id,X-Forwarded-For");
     restServerPublicAccessLogResponseHeaders =
         verifiableProperties.getString("rest.server.public.access.log.response.headers", "Location,x-ambry-blob-size");

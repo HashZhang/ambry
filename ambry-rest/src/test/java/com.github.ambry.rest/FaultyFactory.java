@@ -13,6 +13,8 @@
  */
 package com.github.ambry.rest;
 
+import com.github.ambry.account.AccountService;
+import com.github.ambry.account.AccountServiceFactory;
 import com.github.ambry.router.Router;
 import com.github.ambry.router.RouterFactory;
 
@@ -22,55 +24,55 @@ import com.github.ambry.router.RouterFactory;
  * <p/>
  * Public because factories are usually constructed via {@link com.github.ambry.utils.Utils#getObj(String, Object...)}
  */
-public class FaultyFactory implements BlobStorageServiceFactory, NioServerFactory, RestRequestHandlerFactory, RestResponseHandlerFactory, RouterFactory {
+public class FaultyFactory implements AccountServiceFactory, BlobStorageServiceFactory, NioServerFactory, RestRequestHandlerFactory, RestResponseHandlerFactory, RouterFactory {
 
   // for RestResponseHandlerFactory
   public FaultyFactory(Object obj1, Object obj2) {
     // don't care.
   }
 
-  // for RestRequestHandlerFactory and RouterFactory
+  // for RestRequestHandlerFactory and AccountServiceFactory
   public FaultyFactory(Object obj1, Object obj2, Object obj3) {
     // don't care.
   }
 
-  // for NioServerFactory
+  // for BlobStorageServiceFactory and RouterFactory
   public FaultyFactory(Object obj1, Object obj2, Object obj3, Object obj4, Object obj5) {
     // don't care.
   }
 
-  // for BlobStorageServiceFactory
-  public FaultyFactory(Object... objs) {
+  // for NioServerFactory
+  public FaultyFactory(Object obj1, Object obj2, Object obj3, Object obj4, Object obj5, Object obj6) {
     // don't care.
   }
 
   @Override
-  public BlobStorageService getBlobStorageService()
-      throws InstantiationException {
+  public BlobStorageService getBlobStorageService() throws InstantiationException {
     return null;
   }
 
   @Override
-  public NioServer getNioServer()
-      throws InstantiationException {
+  public NioServer getNioServer() throws InstantiationException {
     return null;
   }
 
   @Override
-  public Router getRouter()
-      throws InstantiationException {
+  public Router getRouter() throws InstantiationException {
     return null;
   }
 
   @Override
-  public RestResponseHandler getRestResponseHandler()
-      throws InstantiationException {
+  public RestResponseHandler getRestResponseHandler() throws InstantiationException {
     return null;
   }
 
   @Override
-  public RestRequestHandler getRestRequestHandler()
-      throws InstantiationException {
+  public RestRequestHandler getRestRequestHandler() throws InstantiationException {
+    return null;
+  }
+
+  @Override
+  public AccountService getAccountService() throws InstantiationException {
     return null;
   }
 }

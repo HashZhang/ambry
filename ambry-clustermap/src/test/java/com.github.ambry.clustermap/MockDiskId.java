@@ -16,6 +16,8 @@ package com.github.ambry.clustermap;
 public class MockDiskId implements DiskId {
   String mountPath;
   MockDataNodeId dataNode;
+  HardwareState state = HardwareState.AVAILABLE;
+  private boolean allowChangesThroughClustermap = true;
 
   public MockDiskId(MockDataNodeId dataNode, String mountPath) {
     this.mountPath = mountPath;
@@ -29,7 +31,7 @@ public class MockDiskId implements DiskId {
 
   @Override
   public HardwareState getState() {
-    return HardwareState.AVAILABLE;
+    return state;
   }
 
   @Override
@@ -37,11 +39,49 @@ public class MockDiskId implements DiskId {
     return 100000;
   }
 
-  public void onDiskError() {
-    /* no-op for now */
+  public synchronized void onDiskError() {
+    if (allowChangesThroughClustermap) {
+      state = HardwareState.UNAVAILABLE;
+    }
   }
 
-  public void onDiskOk() {
-    /* no-op for now */
+  public synchronized void onDiskOk() {
+    if (allowChangesThroughClustermap) {
+      state = HardwareState.AVAILABLE;
+    }
+  }
+
+  /**
+   * Forcibly set disk state {@link HardwareState} and specify whether ClusterMap is allowed to change disk state.
+   * @param state the hardware state of disk
+   * @param allowChangesThroughClusterMap whether the ClusterMap is allowed to change disk state
+   */
+  public synchronized void setDiskState(HardwareState state, boolean allowChangesThroughClusterMap) {
+    this.allowChangesThroughClustermap = allowChangesThroughClusterMap;
+    this.state = state;
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) {
+      return true;
+    }
+    if (o == null || getClass() != o.getClass()) {
+      return false;
+    }
+
+    MockDiskId that = (MockDiskId) o;
+
+    if (!mountPath.equals(that.mountPath)) {
+      return false;
+    }
+    return dataNode.equals(that.dataNode);
+  }
+
+  @Override
+  public int hashCode() {
+    int result = mountPath.hashCode();
+    result = 31 * result + dataNode.hashCode();
+    return result;
   }
 }

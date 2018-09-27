@@ -14,23 +14,27 @@
 package com.github.ambry.clustermap;
 
 import com.github.ambry.config.ClusterMapConfig;
+import com.github.ambry.utils.SystemTime;
 
 
 public class FixedBackoffResourceStatePolicyFactory implements ResourceStatePolicyFactory {
   private ResourceStatePolicy resourceStatePolicy;
 
   public FixedBackoffResourceStatePolicyFactory(Resource resource, HardwareState initialState,
-      ClusterMapConfig clusterMapConfig)
-      throws InstantiationError {
+      ClusterMapConfig clusterMapConfig) throws InstantiationError {
     resourceStatePolicy = null;
     if (resource instanceof DataNodeId) {
       resourceStatePolicy = new FixedBackoffResourceStatePolicy(resource, initialState == HardwareState.UNAVAILABLE,
           clusterMapConfig.clusterMapFixedTimeoutDatanodeErrorThreshold,
-          clusterMapConfig.clusterMapFixedTimeoutDataNodeRetryBackoffMs);
+          clusterMapConfig.clusterMapFixedTimeoutDataNodeRetryBackoffMs, SystemTime.getInstance());
     } else if (resource instanceof DiskId) {
       resourceStatePolicy = new FixedBackoffResourceStatePolicy(resource, initialState == HardwareState.UNAVAILABLE,
           clusterMapConfig.clusterMapFixedTimeoutDiskErrorThreshold,
-          clusterMapConfig.clusterMapFixedTimeoutDiskRetryBackoffMs);
+          clusterMapConfig.clusterMapFixedTimeoutDiskRetryBackoffMs, SystemTime.getInstance());
+    } else if (resource instanceof ReplicaId) {
+      resourceStatePolicy = new FixedBackoffResourceStatePolicy(resource, initialState == HardwareState.UNAVAILABLE,
+          clusterMapConfig.clusterMapFixedTimeoutReplicaErrorThreshold,
+          clusterMapConfig.clusterMapFixedTimeoutReplicaRetryBackoffMs, SystemTime.getInstance());
     }
 
     if (resourceStatePolicy == null) {

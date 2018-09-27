@@ -13,19 +13,24 @@
  */
 package com.github.ambry.router;
 
+import com.codahale.metrics.Counter;
+import com.codahale.metrics.Histogram;
 import com.github.ambry.clustermap.ClusterMap;
+import com.github.ambry.clustermap.PartitionId;
 import com.github.ambry.clustermap.ReplicaId;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.ResponseHandler;
-import com.github.ambry.commons.ServerErrorCode;
 import com.github.ambry.config.RouterConfig;
+import com.github.ambry.messageformat.BlobProperties;
 import com.github.ambry.messageformat.MessageFormatFlags;
 import com.github.ambry.network.ResponseInfo;
-import com.github.ambry.protocol.GetOptions;
+import com.github.ambry.protocol.GetOption;
 import com.github.ambry.protocol.GetRequest;
 import com.github.ambry.protocol.GetResponse;
 import com.github.ambry.protocol.PartitionRequestInfo;
+import com.github.ambry.store.MessageInfo;
 import com.github.ambry.utils.Time;
+import com.github.ambry.utils.Utils;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
@@ -41,15 +46,21 @@ abstract class GetOperation {
   protected final NonBlockingRouterMetrics routerMetrics;
   protected final ClusterMap clusterMap;
   protected final ResponseHandler responseHandler;
-  protected final FutureResult<GetBlobResult> operationFuture;
-  protected final Callback<GetBlobResult> operationCallback;
+  protected final Callback<GetBlobResultInternal> getOperationCallback;
   protected final BlobId blobId;
-  protected final GetBlobOptions options;
+  protected final GetBlobOptionsInternal options;
+  protected final KeyManagementService kms;
+  protected final CryptoService cryptoService;
+  protected final CryptoJobHandler cryptoJobHandler;
   protected final Time time;
+  private final Histogram localColoTracker;
+  private final Histogram crossColoTracker;
+  private final Counter pastDueCounter;
   protected volatile boolean operationCompleted = false;
   protected final AtomicReference<Exception> operationException = new AtomicReference<>();
-  protected GetBlobResult operationResult;
+  protected GetBlobResultInternal operationResult;
   protected final long submissionTimeMs;
+  protected final boolean isEncrypted;
 
   private static final Logger logger = LoggerFactory.getLogger(GetOperation.class);
 
@@ -59,42 +70,48 @@ abstract class GetOperation {
    * @param routerMetrics The {@link NonBlockingRouterMetrics} to be used for reporting metrics.
    * @param clusterMap the {@link ClusterMap} of the cluster
    * @param responseHandler the {@link ResponseHandler} responsible for failure detection.
-   * @param blobIdStr the blobId of the associated blob in string form.
-   * @param futureResult the future that will contain the result of the operation.
-   * @param operationCallback the callback that is to be called when the operation completes.
+   * @param blobId the {@link BlobId} of the associated blob
+   * @param options the {@link GetBlobOptionsInternal} associated with this operation.
+   * @param getOperationCallback the callback that is to be called when the operation completes.
+   * @param localColoTracker the {@link Histogram} that tracks intra datacenter latencies for this class of requests.
+   * @param crossColoTracker the {@link Histogram} that tracks inter datacenter latencies for this class of requests.
+   * @param pastDueCounter the {@link Counter} that tracks the number of times a request is past due.
+   * @param kms {@link KeyManagementService} to assist in fetching container keys for encryption or decryption
+   * @param cryptoService {@link CryptoService} to assist in encryption or decryption
+   * @param cryptoJobHandler {@link CryptoJobHandler} to assist in the execution of crypto jobs
    * @param time the {@link Time} instance to use.
-   * @throws RouterException if there is an error with any of the parameters, such as an invalid blob id.
+   * @param isEncrypted if encrypted bit is set based on original blobId string.
    */
   GetOperation(RouterConfig routerConfig, NonBlockingRouterMetrics routerMetrics, ClusterMap clusterMap,
-      ResponseHandler responseHandler, String blobIdStr, GetBlobOptions options,
-      FutureResult<GetBlobResult> futureResult, Callback<GetBlobResult> operationCallback, Time time)
-      throws RouterException {
+      ResponseHandler responseHandler, BlobId blobId, GetBlobOptionsInternal options,
+      Callback<GetBlobResultInternal> getOperationCallback, Histogram localColoTracker, Histogram crossColoTracker,
+      Counter pastDueCounter, KeyManagementService kms, CryptoService cryptoService, CryptoJobHandler cryptoJobHandler,
+      Time time, boolean isEncrypted) {
     this.routerConfig = routerConfig;
     this.routerMetrics = routerMetrics;
     this.clusterMap = clusterMap;
     this.responseHandler = responseHandler;
     this.options = options;
-    this.operationFuture = futureResult;
-    this.operationCallback = operationCallback;
+    this.getOperationCallback = getOperationCallback;
+    this.localColoTracker = localColoTracker;
+    this.crossColoTracker = crossColoTracker;
+    this.pastDueCounter = pastDueCounter;
+    this.kms = kms;
+    this.cryptoService = cryptoService;
+    this.cryptoJobHandler = cryptoJobHandler;
     this.time = time;
     submissionTimeMs = time.milliseconds();
-    blobId = RouterUtils.getBlobIdFromString(blobIdStr, clusterMap);
-  }
-
-  /**
-   * Return the {@link FutureResult} associated with this operation.
-   * @return the {@link FutureResult} associated with this operation.
-   */
-  FutureResult<GetBlobResult> getFuture() {
-    return operationFuture;
+    this.blobId = blobId;
+    this.isEncrypted = isEncrypted;
+    validateTrackerType();
   }
 
   /**
    * Return the {@link Callback} associated with this operation.
    * @return the {@link Callback} associated with this operation.
    */
-  Callback<GetBlobResult> getCallback() {
-    return operationCallback;
+  Callback<GetBlobResultInternal> getCallback() {
+    return getOperationCallback;
   }
 
   /**
@@ -109,7 +126,7 @@ abstract class GetOperation {
    * Return the result of the operation.
    * @return the operation result.
    */
-  GetBlobResult getOperationResult() {
+  GetBlobResultInternal getOperationResult() {
     return operationResult;
   }
 
@@ -124,7 +141,7 @@ abstract class GetOperation {
   /**
    * @return The {@link GetBlobOptions} associated with this operation.
    */
-  GetBlobOptions getOptions() {
+  GetBlobOptionsInternal getOptions() {
     return options;
   }
 
@@ -158,21 +175,63 @@ abstract class GetOperation {
 
   /**
    * Set the exception associated with this operation.
-   * A {@link ServerErrorCode#Blob_Deleted} or {@link ServerErrorCode#Blob_Expired} error overrides any other
-   * previously received exception.
+   * First, if current operationException is null, directly set operationException as exception;
+   * Second, if operationException exists, compare ErrorCodes of exception and existing operation Exception depending
+   * on precedence level. An ErrorCode with a smaller precedence level overrides an ErrorCode with a larger precedence
+   * level. Update the operationException if necessary.
    * @param exception the {@link RouterException} to possibly set.
    */
   void setOperationException(Exception exception) {
     if (exception instanceof RouterException) {
       RouterErrorCode routerErrorCode = ((RouterException) exception).getErrorCode();
-      if (operationException.get() == null || routerErrorCode == RouterErrorCode.BlobDeleted
-          || routerErrorCode == RouterErrorCode.BlobExpired) {
+      if (operationException.get() == null) {
         operationException.set(exception);
+      } else {
+        Integer currentOperationExceptionLevel = null;
+        if (operationException.get() instanceof RouterException) {
+          currentOperationExceptionLevel =
+              getPrecedenceLevel(((RouterException) operationException.get()).getErrorCode());
+        } else {
+          currentOperationExceptionLevel = getPrecedenceLevel(RouterErrorCode.UnexpectedInternalError);
+        }
+        if (getPrecedenceLevel(routerErrorCode) < currentOperationExceptionLevel) {
+          operationException.set(exception);
+        }
       }
     } else {
       if (operationException.get() == null) {
         operationException.set(exception);
       }
+    }
+  }
+
+  /**
+   * Gets the precedence level for a {@link RouterErrorCode}. A precedence level is a relative priority assigned
+   * to a {@link RouterErrorCode}. If a {@link RouterErrorCode} has not been assigned a precedence level, a
+   * {@code Integer.MIN_VALUE} will be returned.
+   * @param routerErrorCode The {@link RouterErrorCode} for which to get its precedence level.
+   * @return The precedence level of the {@link RouterErrorCode}.
+   */
+  private Integer getPrecedenceLevel(RouterErrorCode routerErrorCode) {
+    switch (routerErrorCode) {
+      case BlobAuthorizationFailure:
+        return 1;
+      case BlobDeleted:
+        return 2;
+      case BlobExpired:
+        return 3;
+      case RangeNotSatisfiable:
+        return 4;
+      case AmbryUnavailable:
+        return 5;
+      case UnexpectedInternalError:
+        return 6;
+      case OperationTimedOut:
+        return 7;
+      case BlobDoesNotExist:
+        return 8;
+      default:
+        return Integer.MIN_VALUE;
     }
   }
 
@@ -183,12 +242,62 @@ abstract class GetOperation {
    * @param flag The {@link MessageFormatFlags} to be set with the GetRequest.
    * @return the created GetRequest.
    */
-  protected GetRequest createGetRequest(BlobId blobId, MessageFormatFlags flag, GetOptions getOptions) {
+  protected GetRequest createGetRequest(BlobId blobId, MessageFormatFlags flag, GetOption getOption) {
     List<BlobId> blobIds = Collections.singletonList(blobId);
     List<PartitionRequestInfo> partitionRequestInfoList =
         Collections.singletonList(new PartitionRequestInfo(blobId.getPartition(), blobIds));
     return new GetRequest(NonBlockingRouter.correlationIdGenerator.incrementAndGet(), routerConfig.routerHostname, flag,
-        partitionRequestInfoList, getOptions);
+        partitionRequestInfoList, getOption);
+  }
+
+  /**
+   * Gets an {@link OperationTracker} based on the config and {@code partitionId}.
+   * @param partitionId the {@link PartitionId} for which a tracker is required.
+   * @return an {@link OperationTracker} based on the config and {@code partitionId}.
+   */
+  protected OperationTracker getOperationTracker(PartitionId partitionId, byte datacenterId) {
+    OperationTracker operationTracker;
+    String trackerType = routerConfig.routerGetOperationTrackerType;
+    String originatingDcName = clusterMap.getDatacenterName(datacenterId);
+    if (trackerType.equals(SimpleOperationTracker.class.getSimpleName())) {
+      operationTracker = new SimpleOperationTracker(routerConfig.routerDatacenterName, partitionId,
+          routerConfig.routerGetCrossDcEnabled, originatingDcName,
+          routerConfig.routerGetIncludeNonOriginatingDcReplicas, routerConfig.routerGetReplicasRequired,
+          routerConfig.routerGetSuccessTarget, routerConfig.routerGetRequestParallelism);
+    } else if (trackerType.equals(AdaptiveOperationTracker.class.getSimpleName())) {
+      operationTracker = new AdaptiveOperationTracker(routerConfig.routerDatacenterName, partitionId,
+          routerConfig.routerGetCrossDcEnabled, originatingDcName,
+          routerConfig.routerGetIncludeNonOriginatingDcReplicas, routerConfig.routerGetReplicasRequired,
+          routerConfig.routerGetSuccessTarget, routerConfig.routerGetRequestParallelism, time, localColoTracker,
+          crossColoTracker, pastDueCounter, routerConfig.routerLatencyToleranceQuantile);
+    } else {
+      throw new IllegalArgumentException("Unrecognized tracker type: " + trackerType);
+    }
+    return operationTracker;
+  }
+
+  /**
+   * Updates the TTL in {@code blobProperties} if required
+   * @param blobProperties the {@link BlobProperties} of the blob
+   * @param messageInfo the {@link MessageInfo} received with the GET response
+   */
+  protected void updateTtlIfRequired(BlobProperties blobProperties, MessageInfo messageInfo) {
+    if (messageInfo.isTtlUpdated()) {
+      long newTtlSecs =
+          Utils.getTtlInSecsFromExpiryMs(messageInfo.getExpirationTimeInMs(), blobProperties.getCreationTimeInMs());
+      blobProperties.setTimeToLiveInSeconds(newTtlSecs);
+    }
+  }
+
+  /**
+   * Validates the tracker type in config.
+   */
+  private void validateTrackerType() {
+    String trackerType = routerConfig.routerGetOperationTrackerType;
+    if (!trackerType.equals(SimpleOperationTracker.class.getSimpleName()) && !trackerType.equals(
+        AdaptiveOperationTracker.class.getSimpleName())) {
+      throw new IllegalArgumentException("Unrecognized tracker type: " + trackerType);
+    }
   }
 }
 

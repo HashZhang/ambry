@@ -18,7 +18,10 @@ import com.codahale.metrics.Gauge;
 import com.codahale.metrics.Histogram;
 import com.codahale.metrics.JmxReporter;
 import com.codahale.metrics.MetricRegistry;
+import com.github.ambry.account.AccountService;
+import com.github.ambry.account.AccountServiceFactory;
 import com.github.ambry.clustermap.ClusterMap;
+import com.github.ambry.commons.SSLFactory;
 import com.github.ambry.config.RestServerConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.notification.NotificationSystem;
@@ -63,6 +66,7 @@ public class RestServer {
   private final Logger logger = LoggerFactory.getLogger(getClass());
   private final RestServerMetrics restServerMetrics;
   private final JmxReporter reporter;
+  private final AccountService accountService;
   private final Router router;
   private final BlobStorageService blobStorageService;
   private final RestRequestHandler restRequestHandler;
@@ -91,7 +95,8 @@ public class RestServer {
     public final Histogram restResponseHandlerStartTimeInMs;
     public final Histogram restServerShutdownTimeInMs;
     public final Histogram restServerStartTimeInMs;
-    public final Histogram routerCloseTime;
+    public final Histogram routerCloseTimeInMs;
+    public final Histogram accountServiceCloseTimeInMs;
 
     /**
      * Creates an instance of RestServerMetrics using the given {@code metricRegistry}.
@@ -127,7 +132,9 @@ public class RestServer {
           metricRegistry.histogram(MetricRegistry.name(RestServer.class, "RestServerShutdownTimeInMs"));
       restServerStartTimeInMs =
           metricRegistry.histogram(MetricRegistry.name(RestServer.class, "RestServerStartTimeInMs"));
-      routerCloseTime = metricRegistry.histogram(MetricRegistry.name(RestServer.class, "RouterCloseTimeInMs"));
+      routerCloseTimeInMs = metricRegistry.histogram(MetricRegistry.name(RestServer.class, "RouterCloseTimeInMs"));
+      accountServiceCloseTimeInMs =
+          metricRegistry.histogram(MetricRegistry.name(RestServer.class, "AccountServiceCloseTimeInMs"));
 
       Gauge<Integer> restServerStatus = new Gauge<Integer>() {
         @Override
@@ -144,11 +151,11 @@ public class RestServer {
    * @param verifiableProperties the properties that define the behavior of the RestServer and its components.
    * @param clusterMap the {@link ClusterMap} instance that needs to be used.
    * @param notificationSystem the {@link NotificationSystem} instance that needs to be used.
+   * @param sslFactory the {@link SSLFactory} to be used. This can be {@code null} if no components require SSL support.
    * @throws InstantiationException if there is any error instantiating an instance of RestServer.
    */
   public RestServer(VerifiableProperties verifiableProperties, ClusterMap clusterMap,
-      NotificationSystem notificationSystem)
-      throws Exception {
+      NotificationSystem notificationSystem, SSLFactory sslFactory) throws Exception {
     if (verifiableProperties == null || clusterMap == null || notificationSystem == null) {
       throw new IllegalArgumentException("Null arg(s) received during instantiation of RestServer");
     }
@@ -158,18 +165,25 @@ public class RestServer {
     RestRequestMetricsTracker.setDefaults(metricRegistry);
     restServerState = new RestServerState(restServerConfig.restServerHealthCheckUri);
     restServerMetrics = new RestServerMetrics(metricRegistry, restServerState);
+
+    AccountServiceFactory accountServiceFactory =
+        Utils.getObj(restServerConfig.restServerAccountServiceFactory, verifiableProperties,
+            clusterMap.getMetricRegistry());
+    accountService = accountServiceFactory.getAccountService();
+
     RouterFactory routerFactory =
-        Utils.getObj(restServerConfig.restServerRouterFactory, verifiableProperties, clusterMap, notificationSystem);
+        Utils.getObj(restServerConfig.restServerRouterFactory, verifiableProperties, clusterMap, notificationSystem,
+            sslFactory, accountService);
     router = routerFactory.getRouter();
 
-    RestResponseHandlerFactory restResponseHandlerFactory = Utils
-        .getObj(restServerConfig.restServerResponseHandlerFactory,
+    RestResponseHandlerFactory restResponseHandlerFactory =
+        Utils.getObj(restServerConfig.restServerResponseHandlerFactory,
             restServerConfig.restServerResponseHandlerScalingUnitCount, metricRegistry);
     restResponseHandler = restResponseHandlerFactory.getRestResponseHandler();
 
-    BlobStorageServiceFactory blobStorageServiceFactory = Utils
-        .getObj(restServerConfig.restServerBlobStorageServiceFactory, verifiableProperties, clusterMap,
-            restResponseHandler, router);
+    BlobStorageServiceFactory blobStorageServiceFactory =
+        Utils.getObj(restServerConfig.restServerBlobStorageServiceFactory, verifiableProperties, clusterMap,
+            restResponseHandler, router, accountService);
     blobStorageService = blobStorageServiceFactory.getBlobStorageService();
 
     RestRequestHandlerFactory restRequestHandlerFactory = Utils.getObj(restServerConfig.restServerRequestHandlerFactory,
@@ -177,12 +191,14 @@ public class RestServer {
     restRequestHandler = restRequestHandlerFactory.getRestRequestHandler();
     publicAccessLogger = new PublicAccessLogger(restServerConfig.restServerPublicAccessLogRequestHeaders.split(","),
         restServerConfig.restServerPublicAccessLogResponseHeaders.split(","));
-    NioServerFactory nioServerFactory = Utils
-        .getObj(restServerConfig.restServerNioServerFactory, verifiableProperties, metricRegistry, restRequestHandler,
-            publicAccessLogger, restServerState);
+
+    NioServerFactory nioServerFactory =
+        Utils.getObj(restServerConfig.restServerNioServerFactory, verifiableProperties, metricRegistry,
+            restRequestHandler, publicAccessLogger, restServerState, sslFactory);
     nioServer = nioServerFactory.getNioServer();
-    if (router == null || restResponseHandler == null || blobStorageService == null || restRequestHandler == null
-        || nioServer == null) {
+
+    if (accountService == null || router == null || restResponseHandler == null || blobStorageService == null
+        || restRequestHandler == null || nioServer == null) {
       throw new InstantiationException("Some of the server components were null");
     }
     logger.trace("Instantiated RestServer");
@@ -192,8 +208,7 @@ public class RestServer {
    * Starts up all the components required. Returns when startup is FULLY complete.
    * @throws InstantiationException if the RestServer is unable to start.
    */
-  public void start()
-      throws InstantiationException {
+  public void start() throws InstantiationException {
     logger.info("Starting RestServer");
     long startupBeginTime = System.currentTimeMillis();
     try {
@@ -238,6 +253,8 @@ public class RestServer {
 
   /**
    * Shuts down all the components. Returns when shutdown is FULLY complete.
+   * This method is expected to be called in the exit path as long as the RestServer instance construction was
+   * successful. This is expected to be called even if {@link #start()} did not succeed.
    */
   public void shutdown() {
     logger.info("Shutting down RestServer");
@@ -274,10 +291,16 @@ public class RestServer {
       long routerCloseTime = System.currentTimeMillis();
       elapsedTime = routerCloseTime - responseHandlerShutdownTime;
       logger.info("Router close took {} ms", elapsedTime);
-      restServerMetrics.routerCloseTime.update(elapsedTime);
+      restServerMetrics.routerCloseTimeInMs.update(elapsedTime);
+
+      accountService.close();
+      long accountServiceCloseTime = System.currentTimeMillis();
+      elapsedTime = accountServiceCloseTime - routerCloseTime;
+      logger.info("Account service close took {} ms", elapsedTime);
+      restServerMetrics.accountServiceCloseTimeInMs.update(elapsedTime);
 
       reporter.stop();
-      elapsedTime = System.currentTimeMillis() - routerCloseTime;
+      elapsedTime = System.currentTimeMillis() - accountServiceCloseTime;
       logger.info("JMX reporter shutdown took {} ms", elapsedTime);
       restServerMetrics.jmxReporterShutdownTimeInMs.update(elapsedTime);
     } catch (IOException e) {
@@ -294,8 +317,7 @@ public class RestServer {
    * Wait for shutdown to be triggered and for it to complete.
    * @throws InterruptedException if the wait for shutdown is interrupted.
    */
-  public void awaitShutdown()
-      throws InterruptedException {
+  public void awaitShutdown() throws InterruptedException {
     shutdownLatch.await();
   }
 }

@@ -13,8 +13,11 @@
  */
 package com.github.ambry.router;
 
+import com.codahale.metrics.Meter;
 import com.github.ambry.clustermap.ClusterMap;
+import com.github.ambry.clustermap.ClusterMapUtils;
 import com.github.ambry.clustermap.ReplicaId;
+import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.BlobIdFactory;
 import com.github.ambry.commons.ResponseHandler;
 import com.github.ambry.commons.ServerErrorCode;
@@ -25,9 +28,11 @@ import com.github.ambry.network.ResponseInfo;
 import com.github.ambry.protocol.GetRequest;
 import com.github.ambry.protocol.GetResponse;
 import com.github.ambry.protocol.RequestOrResponse;
+import com.github.ambry.store.StoreKey;
 import com.github.ambry.utils.ByteBufferInputStream;
 import com.github.ambry.utils.Time;
 import java.io.DataInputStream;
+import java.io.IOException;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -46,6 +51,9 @@ class GetManager {
   private static final Logger logger = LoggerFactory.getLogger(GetManager.class);
 
   private final Set<GetOperation> getOperations;
+  private final KeyManagementService kms;
+  private final CryptoService cryptoService;
+  private final CryptoJobHandler cryptoJobHandler;
   private final Time time;
   // This helps the GetManager quickly find the appropriate GetOperation to hand over the response to.
   // Requests are added before they are sent out and get cleaned up as and when responses come in.
@@ -59,8 +67,7 @@ class GetManager {
   private final RouterConfig routerConfig;
   private final ResponseHandler responseHandler;
   private final NonBlockingRouterMetrics routerMetrics;
-  private final OperationCompleteCallback operationCompleteCallback;
-  private final ReadyForPollCallback readyForPollCallback;
+  private final RouterCallback routerCallback;
 
   private class GetRequestRegistrationCallbackImpl implements RequestRegistrationCallback<GetOperation> {
     private List<RequestInfo> requestListToFill;
@@ -83,49 +90,82 @@ class GetManager {
    * @param responseHandler The {@link ResponseHandler} used to notify failures for failure detection.
    * @param routerConfig  The {@link RouterConfig} containing the configs for the PutManager.
    * @param routerMetrics The {@link NonBlockingRouterMetrics} to be used for reporting metrics.
-   * @param operationCompleteCallback The {@link OperationCompleteCallback} to use to complete operations.
-   * @param readyForPollCallback The callback to be used to notify the router of any state changes within the
-   *                             operations.
+   * @param routerCallback The {@link RouterCallback} to use for callbacks to the router.
+   * @param kms {@link KeyManagementService} to assist in fetching container keys for encryption or decryption
+   * @param cryptoService {@link CryptoService} to assist in encryption or decryption
+   * @param cryptoJobHandler {@link CryptoJobHandler} to assist in the execution of crypto jobs
    * @param time The {@link Time} instance to use.
    */
   GetManager(ClusterMap clusterMap, ResponseHandler responseHandler, RouterConfig routerConfig,
-      NonBlockingRouterMetrics routerMetrics, OperationCompleteCallback operationCompleteCallback,
-      ReadyForPollCallback readyForPollCallback, Time time) {
+      NonBlockingRouterMetrics routerMetrics, RouterCallback routerCallback, KeyManagementService kms,
+      CryptoService cryptoService, CryptoJobHandler cryptoJobHandler, Time time) {
     this.clusterMap = clusterMap;
     blobIdFactory = new BlobIdFactory(clusterMap);
     this.responseHandler = responseHandler;
     this.routerConfig = routerConfig;
     this.routerMetrics = routerMetrics;
-    this.operationCompleteCallback = operationCompleteCallback;
-    this.readyForPollCallback = readyForPollCallback;
+    this.routerCallback = routerCallback;
+    this.kms = kms;
+    this.cryptoService = cryptoService;
+    this.cryptoJobHandler = cryptoJobHandler;
     this.time = time;
     getOperations = Collections.newSetFromMap(new ConcurrentHashMap<GetOperation, Boolean>());
   }
 
   /**
    * Submit an operation to get a blob asynchronously.
-   * @param blobId The blobId for which the BlobInfo is being requested, in string form.
-   * @param options The {@link GetBlobOptions} associated witht the operation.
-   * @param futureResult The {@link FutureResult} that contains the pending result of the operation.
+   * @param blobIdStr The ID of the blob for which blob data is requested.
+   * @param options The {@link GetBlobOptionsInternal} associated with the operation.
    * @param callback The {@link Callback} object to be called on completion of the operation.
+   * @throws RouterException if the blobIdStr is invalid.
    */
-  void submitGetBlobOperation(String blobId, GetBlobOptions options, FutureResult<GetBlobResult> futureResult,
-      Callback<GetBlobResult> callback) {
+  void submitGetBlobOperation(String blobIdStr, GetBlobOptionsInternal options,
+      Callback<GetBlobResultInternal> callback) throws RouterException {
+    GetOperation getOperation;
+    BlobId blobId = RouterUtils.getBlobIdFromString(blobIdStr, clusterMap);
+    boolean isEncrypted = false;
     try {
-      GetOperation getOperation;
-      if (options.getOperationType() == GetBlobOptions.OperationType.BlobInfo) {
-        getOperation =
-            new GetBlobInfoOperation(routerConfig, routerMetrics, clusterMap, responseHandler, blobId, options,
-                futureResult, callback, operationCompleteCallback, time);
-      } else {
-        getOperation = new GetBlobOperation(routerConfig, routerMetrics, clusterMap, responseHandler, blobId, options,
-            futureResult, callback, operationCompleteCallback, readyForPollCallback, blobIdFactory, time);
-      }
-      getOperations.add(getOperation);
-    } catch (RouterException e) {
-      routerMetrics.onGetBlobError(e, options);
-      routerMetrics.operationDequeuingRate.mark();
-      operationCompleteCallback.completeOperation(futureResult, callback, null, e);
+      BlobId.isEncrypted(blobIdStr);
+    } catch (IOException e) {
+      logger.warn(
+          "This shouldn't happen because getBlobIdFromString() should have thrown RouterException for this case.", e);
+    }
+    if (blobId.getDatacenterId() != ClusterMapUtils.UNKNOWN_DATACENTER_ID
+        && blobId.getDatacenterId() != clusterMap.getLocalDatacenterId()) {
+      routerMetrics.getBlobNotOriginateLocalOperationRate.mark();
+    }
+    trackGetBlobRateMetrics(options.getBlobOptions, isEncrypted);
+    if (options.getBlobOptions.getOperationType() == GetBlobOptions.OperationType.BlobInfo) {
+      getOperation =
+          new GetBlobInfoOperation(routerConfig, routerMetrics, clusterMap, responseHandler, blobId, options, callback,
+              routerCallback, kms, cryptoService, cryptoJobHandler, time, isEncrypted);
+    } else {
+      getOperation =
+          new GetBlobOperation(routerConfig, routerMetrics, clusterMap, responseHandler, blobId, options, callback,
+              routerCallback, blobIdFactory, kms, cryptoService, cryptoJobHandler, time, isEncrypted);
+    }
+    getOperations.add(getOperation);
+  }
+
+  /**
+   * Track get blob rate metrics based on the {@link GetBlobOptions} and whether the blob is encrypted or not
+   * @param options {@link GetBlobOptions} instance to use
+   * @param isEncrypted {@code true} if the blob is encrypted, {@code false} otherwise
+   */
+  private void trackGetBlobRateMetrics(GetBlobOptions options, boolean isEncrypted) {
+    if (options.getOperationType() == GetBlobOptions.OperationType.BlobInfo) {
+      Meter blobInfoOperationRate =
+          isEncrypted ? routerMetrics.getEncryptedBlobInfoOperationRate : routerMetrics.getBlobInfoOperationRate;
+      blobInfoOperationRate.mark();
+    } else {
+      Meter blobOperationRate =
+          isEncrypted ? routerMetrics.getEncryptedBlobOperationRate : routerMetrics.getBlobOperationRate;
+      blobOperationRate.mark();
+    }
+    if (options.getRange() != null) {
+      Meter blobWithRangeOperationRate = isEncrypted ? routerMetrics.getEncryptedBlobWithRangeOperationRate
+          : routerMetrics.getBlobWithRangeOperationRate;
+      blobWithRangeOperationRate.mark();
     }
   }
 
@@ -206,8 +246,8 @@ class GetManager {
     NetworkClientErrorCode networkClientErrorCode = responseInfo.getError();
     if (networkClientErrorCode == null) {
       try {
-        getResponse = GetResponse
-            .readFrom(new DataInputStream(new ByteBufferInputStream(responseInfo.getResponse())), clusterMap);
+        getResponse = GetResponse.readFrom(new DataInputStream(new ByteBufferInputStream(responseInfo.getResponse())),
+            clusterMap);
         ServerErrorCode serverError = getResponse.getError();
         if (serverError == ServerErrorCode.No_Error) {
           serverError = getResponse.getPartitionResponseInfoList().get(0).getErrorCode();
@@ -247,8 +287,44 @@ class GetManager {
     if (remove(op)) {
       op.abort(abortCause);
       routerMetrics.operationAbortCount.inc();
-      routerMetrics.onGetBlobError(abortCause, op.getOptions());
+      routerMetrics.onGetBlobError(abortCause, op.getOptions(), op.isEncrypted);
     }
   }
 }
 
+/**
+ * An internal options class containing parameters to the GetBlob operation.
+ */
+class GetBlobOptionsInternal {
+  final GetBlobOptions getBlobOptions;
+  final boolean getChunkIdsOnly;
+  final NonBlockingRouterMetrics.AgeAtAccessMetrics ageAtAccessTracker;
+
+  /**
+   * Construct an GetBlobOptionsInternal instance
+   * @param getBlobOptions the {@link GetBlobOptions} associated with this instance.
+   * @param getChunkIdsOnly {@code true} if this operation is to fetch just the chunk ids of a composite blob.
+   * @param ageAtAccessTracker the {@link NonBlockingRouterMetrics.AgeAtAccessMetrics} tracker to use.
+   */
+  GetBlobOptionsInternal(GetBlobOptions getBlobOptions, boolean getChunkIdsOnly,
+      NonBlockingRouterMetrics.AgeAtAccessMetrics ageAtAccessTracker) {
+    this.getBlobOptions = getBlobOptions;
+    this.getChunkIdsOnly = getChunkIdsOnly;
+    this.ageAtAccessTracker = ageAtAccessTracker;
+  }
+}
+
+class GetBlobResultInternal {
+  GetBlobResult getBlobResult;
+  List<StoreKey> storeKeys;
+
+  /**
+   * Construct a GetBlobResultInternal instance.
+   * @param getBlobResult The {@link GetBlobResult} associated with this instance, if there is one..
+   * @param storeKeys The store keys associated with this instance, if there are any.
+   */
+  public GetBlobResultInternal(GetBlobResult getBlobResult, List<StoreKey> storeKeys) {
+    this.getBlobResult = getBlobResult;
+    this.storeKeys = storeKeys;
+  }
+}

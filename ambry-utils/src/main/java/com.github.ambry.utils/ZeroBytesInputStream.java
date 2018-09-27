@@ -21,7 +21,6 @@ import java.util.Arrays;
 /** A class that simulates an input stream of the given size that returns bytes of value zero
  *  Note that this is not safe for concurrent access.
  */
-
 public class ZeroBytesInputStream extends InputStream {
   private long streamSize;
   private long position;
@@ -31,15 +30,13 @@ public class ZeroBytesInputStream extends InputStream {
    * @param size The number of zero bytes to be returned.
    * @throws IOException
    */
-  public ZeroBytesInputStream(long size)
-      throws IOException {
+  public ZeroBytesInputStream(long size) throws IOException {
     this.streamSize = size;
     this.position = 0;
   }
 
   @Override
-  public int read()
-      throws IOException {
+  public int read() throws IOException {
     if (position < streamSize) {
       ++position;
       return 0;
@@ -49,8 +46,17 @@ public class ZeroBytesInputStream extends InputStream {
   }
 
   @Override
-  public int read(byte[] bytes, int offset, int length)
-      throws IOException {
+  public int read(byte[] bytes, int offset, int length) throws IOException {
+    if (bytes == null) {
+      throw new NullPointerException();
+    } else if (offset < 0 || length < 0 || length > bytes.length - offset) {
+      throw new IndexOutOfBoundsException();
+    } else if (length == 0) {
+      return 0;
+    }
+    if (position >= streamSize) {
+      return -1;
+    }
     int count = (int) Math.min(length, streamSize - position);
     Arrays.fill(bytes, offset, offset + count, (byte) 0);
     position += count;
@@ -58,11 +64,9 @@ public class ZeroBytesInputStream extends InputStream {
   }
 
   @Override
-  public int available()
-      throws IOException {
-    /* available just has to be an estimate of the bytes remaining. So if the available bytes are greater than
-       what an int can hold, return Integer.MAX_VALUE. */
-    return streamSize - position < Integer.MAX_VALUE ? (int) (streamSize - position) : Integer.MAX_VALUE;
+  public int available() throws IOException {
+    // Return estimate of the bytes remaining, bounded by max int value.
+    return (int) Math.min(streamSize - position, Integer.MAX_VALUE);
   }
 }
 

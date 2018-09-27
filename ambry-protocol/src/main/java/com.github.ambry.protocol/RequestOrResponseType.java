@@ -24,8 +24,10 @@ public enum RequestOrResponseType {
   GetResponse,
   DeleteRequest,
   DeleteResponse,
-  TTLRequest, // Unsupported
-  TTLResponse, // Unsupported
+  TtlUpdateRequest,
+  TtlUpdateResponse,
   ReplicaMetadataRequest,
-  ReplicaMetadataResponse
+  ReplicaMetadataResponse,
+  AdminRequest,
+  AdminResponse
 }

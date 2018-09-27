@@ -15,6 +15,7 @@ package com.github.ambry.rest;
 
 import com.github.ambry.router.Callback;
 import com.github.ambry.router.FutureResult;
+import com.github.ambry.utils.Utils;
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
@@ -58,12 +59,7 @@ public class MockRestResponseChannel implements RestResponseChannel {
    * List of "events" (function calls) that can occur inside MockRestResponseChannel.
    */
   public enum Event {
-    Write,
-    OnRequestComplete,
-    SetStatus,
-    SetHeader,
-    IsOpen,
-    Close
+    Write, OnRequestComplete, SetStatus, SetHeader, IsOpen, Close
   }
 
   /**
@@ -97,14 +93,12 @@ public class MockRestResponseChannel implements RestResponseChannel {
 
   private volatile Exception exception = null;
 
-  public MockRestResponseChannel()
-      throws JSONException {
+  public MockRestResponseChannel() throws JSONException {
     this(null);
   }
 
-  public MockRestResponseChannel(RestRequest restRequest)
-      throws JSONException {
-    responseMetadata.put(RESPONSE_STATUS_KEY, ResponseStatus.Ok);
+  public MockRestResponseChannel(RestRequest restRequest) throws JSONException {
+    responseMetadata.put(RESPONSE_STATUS_KEY, ResponseStatus.Ok.name());
     this.restRequest = restRequest;
   }
 
@@ -139,14 +133,18 @@ public class MockRestResponseChannel implements RestResponseChannel {
       this.exception = exception;
       try {
         if (!responseMetadataFinalized.get() && exception != null) {
-          // clear headers
+          // clear headers except for the value of Allow
+          String allow = getHeader(RestUtils.Headers.ALLOW);
           responseMetadata.put(RESPONSE_HEADERS_KEY, new JSONObject());
+          if (!Utils.isNullOrEmpty(allow)) {
+            setHeader(RestUtils.Headers.ALLOW, allow);
+          }
           setHeader(RestUtils.Headers.CONTENT_TYPE, "text/plain; charset=UTF-8");
           ResponseStatus status = ResponseStatus.InternalServerError;
           if (exception instanceof RestServiceException) {
             status = ResponseStatus.getResponseStatus(((RestServiceException) exception).getErrorCode());
           }
-          responseMetadata.put(RESPONSE_STATUS_KEY, status);
+          responseMetadata.put(RESPONSE_STATUS_KEY, status.name());
           bodyBytes.write(exception.toString().getBytes());
           responseMetadataFinalized.set(true);
         }
@@ -163,11 +161,10 @@ public class MockRestResponseChannel implements RestResponseChannel {
   }
 
   @Override
-  public synchronized void setStatus(ResponseStatus status)
-      throws RestServiceException {
+  public synchronized void setStatus(ResponseStatus status) throws RestServiceException {
     if (isOpen() && !responseMetadataFinalized.get()) {
       try {
-        responseMetadata.put(RESPONSE_STATUS_KEY, status);
+        responseMetadata.put(RESPONSE_STATUS_KEY, status.name());
         onEventComplete(Event.SetStatus);
       } catch (JSONException e) {
         throw new RestServiceException("Unable to set Status", RestServiceErrorCode.InternalServerError);
@@ -191,8 +188,7 @@ public class MockRestResponseChannel implements RestResponseChannel {
   }
 
   @Override
-  public synchronized void setHeader(String headerName, Object headerValue)
-      throws RestServiceException {
+  public synchronized void setHeader(String headerName, Object headerValue) throws RestServiceException {
     setHeader(headerName, headerValue, Event.SetHeader);
   }
 
@@ -202,7 +198,7 @@ public class MockRestResponseChannel implements RestResponseChannel {
     try {
       if (responseMetadata.has(RESPONSE_HEADERS_KEY) && responseMetadata.getJSONObject(RESPONSE_HEADERS_KEY)
           .has(headerName)) {
-        headerValue = responseMetadata.getJSONObject(RESPONSE_HEADERS_KEY).getString(headerName);
+        headerValue = responseMetadata.getJSONObject(RESPONSE_HEADERS_KEY).get(headerName).toString();
       }
     } catch (JSONException e) {
       throw new IllegalStateException(e);
@@ -232,8 +228,7 @@ public class MockRestResponseChannel implements RestResponseChannel {
    * @throws IllegalStateException if the response metadata has already been finalized.
    * @throws RestServiceException if there is an error building or setting the header in the response.
    */
-  private void setHeader(String headerName, Object headerValue, Event eventToFire)
-      throws RestServiceException {
+  private void setHeader(String headerName, Object headerValue, Event eventToFire) throws RestServiceException {
     if (headerName != null && headerValue != null) {
       if (isOpen() && !responseMetadataFinalized.get()) {
         try {

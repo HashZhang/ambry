@@ -56,15 +56,16 @@ import java.util.NoSuchElementException;
  *
  */
 class SimpleOperationTracker implements OperationTracker {
-  private final int successTarget;
-  private final int parallelism;
-  private final LinkedList<ReplicaId> replicaPool = new LinkedList<ReplicaId>();
-  private final OpTrackerIterator otIterator;
+  protected final int successTarget;
+  protected final int parallelism;
+  protected final LinkedList<ReplicaId> replicaPool = new LinkedList<ReplicaId>();
 
-  private int totalReplicaCount = 0;
-  private int inflightCount = 0;
-  private int succeededCount = 0;
-  private int failedCount = 0;
+  protected int totalReplicaCount = 0;
+  protected int inflightCount = 0;
+  protected int succeededCount = 0;
+  protected int failedCount = 0;
+
+  private final OpTrackerIterator otIterator;
   private Iterator<ReplicaId> replicaIterator;
 
   /**
@@ -74,28 +75,41 @@ class SimpleOperationTracker implements OperationTracker {
    * @param partitionId The partition on which the operation is performed.
    * @param crossColoEnabled {@code true} if requests can be sent to remote replicas, {@code false}
    *                                otherwise.
+   * @param originatingDcName The original DC where blob was put.
+   * @param includeNonOriginatingDcReplicas if take the option to include remote non originating DC replicas.
+   * @param replicasRequired The number of replicas required for the operation.
    * @param successTarget The number of successful responses required to succeed the operation.
    * @param parallelism The maximum number of inflight requests at any point of time.
    * @param shuffleReplicas Indicates if the replicas need to be shuffled.
    */
-  SimpleOperationTracker(String datacenterName, PartitionId partitionId, boolean crossColoEnabled, int successTarget,
+  SimpleOperationTracker(String datacenterName, PartitionId partitionId, boolean crossColoEnabled,
+      String originatingDcName, boolean includeNonOriginatingDcReplicas, int replicasRequired, int successTarget,
       int parallelism, boolean shuffleReplicas) {
+    if (parallelism < 1) {
+      throw new IllegalArgumentException("Parallelism has to be > 0. Configured to be " + parallelism);
+    }
     this.successTarget = successTarget;
     this.parallelism = parallelism;
     // Order the replicas so that local healthy replicas are ordered and returned first,
     // then the remote healthy ones, and finally the possibly down ones.
-    List<ReplicaId> replicas = partitionId.getReplicaIds();
+    List<? extends ReplicaId> replicas = partitionId.getReplicaIds();
+    LinkedList<ReplicaId> backupReplicas = new LinkedList<>();
     LinkedList<ReplicaId> downReplicas = new LinkedList<>();
     if (shuffleReplicas) {
       Collections.shuffle(replicas);
     }
+    // The priority here is local dc replicas, originating dc replicas, other dc replicas, down replicas.
+    // To improve read-after-write performance across DC, we prefer to take local and originating replicas only,
+    // which can be done by setting includeNonOriginatingDcReplicas False.
     for (ReplicaId replicaId : replicas) {
       String replicaDcName = replicaId.getDataNodeId().getDatacenterName();
       if (!replicaId.isDown()) {
         if (replicaDcName.equals(datacenterName)) {
           replicaPool.addFirst(replicaId);
-        } else if (crossColoEnabled) {
+        } else if (crossColoEnabled && replicaDcName.equals(originatingDcName)) {
           replicaPool.addLast(replicaId);
+        } else if (crossColoEnabled) {
+          backupReplicas.addFirst(replicaId);
         }
       } else {
         if (replicaDcName.equals(datacenterName)) {
@@ -105,11 +119,39 @@ class SimpleOperationTracker implements OperationTracker {
         }
       }
     }
-    replicaPool.addAll(downReplicas);
+    if (includeNonOriginatingDcReplicas || originatingDcName == null) {
+      replicaPool.addAll(backupReplicas);
+      replicaPool.addAll(downReplicas);
+    } else {
+      // This is for get request only. Take replicasRequired copy of replicas to do the request
+      // Please note replicasRequired is 6 because total number of local and originating replicas is always <= 6.
+      // This may no longer be true with partition classes and flexible replication.
+      // Don't do this if originatingDcName is unknown.
+      while (replicaPool.size() < replicasRequired && backupReplicas.size() > 0) {
+        replicaPool.add(backupReplicas.pollFirst());
+      }
+      while (replicaPool.size() < replicasRequired && downReplicas.size() > 0) {
+        replicaPool.add(downReplicas.pollFirst());
+      }
+    }
     totalReplicaCount = replicaPool.size();
     if (totalReplicaCount < successTarget) {
-      throw new IllegalArgumentException(
-          "Total Replica count " + totalReplicaCount + " is less than success target " + successTarget);
+      StringBuilder errMsg = new StringBuilder("Total Replica count ").append(totalReplicaCount)
+          .append(" is less than success target ")
+          .append(successTarget)
+          .append(". Partition is ")
+          .append(partitionId)
+          .append(" and partition class is ")
+          .append(partitionId.getPartitionClass())
+          .append(". Replicas selected are: ");
+      for (ReplicaId replicaId : replicaPool) {
+        errMsg.append(replicaId.getDataNodeId()).append(":").append(replicaId.isDown()).append(" ");
+      }
+      errMsg.append("Original replicas are: ");
+      for (ReplicaId replicaId : replicas) {
+        errMsg.append(replicaId.getDataNodeId()).append(":").append(replicaId.isDown()).append(" ");
+      }
+      throw new IllegalArgumentException(errMsg.toString());
     }
     this.otIterator = new OpTrackerIterator();
   }
@@ -119,14 +161,18 @@ class SimpleOperationTracker implements OperationTracker {
    *
    * @param datacenterName The datacenter where the router is located.
    * @param partitionId The partition on which the operation is performed.
-   * @param crossColoEnabled {@code true} if requests can be sent to remote replicas, {@code false}
-   *                                otherwise.
+   * @param crossColoEnabled {@code true} if requests can be sent to remote replicas, {@code false} otherwise.
+   * @param originatingDcName The original DC where blob was put. null if DC unknown.
+   * @param includeNonOriginatingDcReplicas if take the option to include remote non originating DC replicas.
+   * @param replicasRequired The number of replicas required for the operation.
    * @param successTarget The number of successful responses required to succeed the operation.
    * @param parallelism The maximum number of inflight requests at any point of time.
    */
-  SimpleOperationTracker(String datacenterName, PartitionId partitionId, boolean crossColoEnabled, int successTarget,
+  SimpleOperationTracker(String datacenterName, PartitionId partitionId, boolean crossColoEnabled,
+      String originatingDcName, boolean includeNonOriginatingDcReplicas, int replicasRequired, int successTarget,
       int parallelism) {
-    this(datacenterName, partitionId, crossColoEnabled, successTarget, parallelism, true);
+    this(datacenterName, partitionId, crossColoEnabled, originatingDcName, includeNonOriginatingDcReplicas,
+        replicasRequired, successTarget, parallelism, true);
   }
 
   @Override
